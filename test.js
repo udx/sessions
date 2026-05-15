@@ -2,14 +2,18 @@
 
 import assert from 'assert';
 import { execSync } from 'child_process';
+import { existsSync } from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI = `node ${path.join(__dirname, 'index.js')}`;
+const HAS_DATA = existsSync(path.join(os.homedir(), '.claude', 'projects'));
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
 
 function test(name, fn) {
   try {
@@ -23,19 +27,44 @@ function test(name, fn) {
   }
 }
 
+function testData(name, fn) {
+  if (!HAS_DATA) {
+    skipped++;
+    console.log(`  \x1b[33m\u25cb\x1b[0m ${name} (skipped — no session data)`);
+    return;
+  }
+  test(name, fn);
+}
+
 function run(cmd, timeout = 30000) {
   return execSync(`${CLI} ${cmd}`, { encoding: 'utf8', timeout, env: { ...process.env, NO_COLOR: '1' } });
 }
 
+console.log('\nhelp output');
+test('--help shows all commands', () => {
+  const out = run('--help');
+  assert(out.includes('list'), 'should show list command');
+  assert(out.includes('search'), 'should show search command');
+  assert(out.includes('show'), 'should show show command');
+  assert(out.includes('projects'), 'should show projects command');
+  assert(out.includes('export'), 'should show export command');
+  assert(out.includes('history'), 'should show history command');
+});
+
+test('--version shows version', () => {
+  const out = run('--version');
+  assert(/^\d+\.\d+\.\d+/.test(out.trim()), 'should show semver version');
+});
+
 console.log('\nprojects command');
-test('returns valid JSON', () => {
+testData('returns valid JSON', () => {
   const out = run('projects --json');
   const data = JSON.parse(out);
   assert(Array.isArray(data), 'should be array');
   assert(data.length > 0, 'should have projects');
 });
 
-test('shows project paths and session counts', () => {
+testData('shows project paths and session counts', () => {
   const out = run('projects --json');
   const data = JSON.parse(out);
   for (const p of data) {
@@ -45,13 +74,13 @@ test('shows project paths and session counts', () => {
   }
 });
 
-test('human-readable output works', () => {
+testData('human-readable output works', () => {
   const out = run('projects');
   assert(out.includes('projects'), 'should mention projects');
 });
 
 console.log('\nlist command');
-test('lists sessions as JSON', () => {
+testData('lists sessions as JSON', () => {
   const out = run('list --limit 3 --json');
   const data = JSON.parse(out);
   assert(Array.isArray(data), 'should be array');
@@ -59,7 +88,7 @@ test('lists sessions as JSON', () => {
   assert(data.length <= 3, 'should respect limit');
 });
 
-test('sessions have required fields', () => {
+testData('sessions have required fields', () => {
   const out = run('list --limit 1 --json');
   const data = JSON.parse(out);
   const s = data[0];
@@ -70,12 +99,12 @@ test('sessions have required fields', () => {
   assert(s.firstPrompt !== undefined, 'should have firstPrompt');
 });
 
-test('human-readable list works', () => {
+testData('human-readable list works', () => {
   const out = run('list --limit 3');
   assert(out.includes('sessions'), 'should mention sessions');
 });
 
-test('--project filter works', () => {
+testData('--project filter works', () => {
   const out = run('list --limit 50 --json');
   const all = JSON.parse(out);
   if (all.length > 1) {
@@ -87,14 +116,14 @@ test('--project filter works', () => {
   }
 });
 
-test('--full flag provides message counts', () => {
+testData('--full flag provides message counts', () => {
   const out = run('list --limit 1 --full --json');
   const data = JSON.parse(out);
   assert(data[0].messageCount !== undefined, 'should have messageCount with --full');
 });
 
 console.log('\nshow command');
-test('shows session by short ID', () => {
+testData('shows session by short ID', () => {
   const listOut = run('list --limit 1 --json');
   const sessions = JSON.parse(listOut);
   const shortId = sessions[0].shortId;
@@ -104,7 +133,7 @@ test('shows session by short ID', () => {
   assert(messages.length > 0, 'should have messages');
 });
 
-test('--user-only filter works', () => {
+testData('--user-only filter works', () => {
   const listOut = run('list --limit 1 --json');
   const sessions = JSON.parse(listOut);
   const shortId = sessions[0].shortId;
@@ -113,7 +142,7 @@ test('--user-only filter works', () => {
   assert(messages.every(m => m.type === 'user'), 'all should be user messages');
 });
 
-test('--assistant-only filter works', () => {
+testData('--assistant-only filter works', () => {
   const listOut = run('list --limit 1 --json');
   const sessions = JSON.parse(listOut);
   const shortId = sessions[0].shortId;
@@ -122,7 +151,7 @@ test('--assistant-only filter works', () => {
   assert(messages.every(m => m.type === 'assistant'), 'all should be assistant messages');
 });
 
-test('human-readable show works', () => {
+testData('human-readable show works', () => {
   const listOut = run('list --limit 1 --json');
   const sessions = JSON.parse(listOut);
   const shortId = sessions[0].shortId;
@@ -140,13 +169,13 @@ test('invalid session ID errors', () => {
 });
 
 console.log('\nsearch command');
-test('finds matches in transcripts', () => {
+testData('finds matches in transcripts', () => {
   const out = run('search "claude" --limit 3 --json', 60000);
   const data = JSON.parse(out);
   assert(Array.isArray(data), 'should be array');
 });
 
-test('search returns expected fields', () => {
+testData('search returns expected fields', () => {
   const out = run('search "the" --limit 1 --json', 60000);
   const data = JSON.parse(out);
   if (data.length > 0) {
@@ -158,13 +187,13 @@ test('search returns expected fields', () => {
   }
 });
 
-test('human-readable search works', () => {
+testData('human-readable search works', () => {
   const out = run('search "session" --limit 3', 60000);
   assert(typeof out === 'string', 'should return string output');
 });
 
 console.log('\nexport command');
-test('exports session as markdown', () => {
+testData('exports session as markdown', () => {
   const listOut = run('list --limit 1 --json');
   const sessions = JSON.parse(listOut);
   const shortId = sessions[0].shortId;
@@ -172,7 +201,7 @@ test('exports session as markdown', () => {
   assert(out.includes('# Session:'), 'should have markdown header');
 });
 
-test('exports session as text', () => {
+testData('exports session as text', () => {
   const listOut = run('list --limit 1 --json');
   const sessions = JSON.parse(listOut);
   const shortId = sessions[0].shortId;
@@ -180,7 +209,7 @@ test('exports session as text', () => {
   assert(out.includes('[YOU]') || out.includes('[CLAUDE]'), 'should have text format markers');
 });
 
-test('exports session as json', () => {
+testData('exports session as json', () => {
   const listOut = run('list --limit 20 --json');
   const sessions = JSON.parse(listOut);
   const smallest = sessions.reduce((a, b) => a.size < b.size ? a : b);
@@ -190,27 +219,17 @@ test('exports session as json', () => {
 });
 
 console.log('\nhistory command');
-test('shows history entries', () => {
+testData('shows history entries', () => {
   const out = run('history --limit 5 --json');
   const data = JSON.parse(out);
   assert(Array.isArray(data), 'should be array');
 });
 
-test('human-readable history works', () => {
+testData('human-readable history works', () => {
   const out = run('history --limit 5');
   assert(typeof out === 'string', 'should return string');
 });
 
-console.log('\nhelp output');
-test('--help shows all commands', () => {
-  const out = run('--help');
-  assert(out.includes('list'), 'should show list command');
-  assert(out.includes('search'), 'should show search command');
-  assert(out.includes('show'), 'should show show command');
-  assert(out.includes('projects'), 'should show projects command');
-  assert(out.includes('export'), 'should show export command');
-  assert(out.includes('history'), 'should show history command');
-});
-
-console.log(`\n\x1b[${failed ? '31' : '32'}m${passed} passed, ${failed} failed\x1b[0m\n`);
+const skipMsg = skipped > 0 ? `, ${skipped} skipped` : '';
+console.log(`\n\x1b[${failed ? '31' : '32'}m${passed} passed, ${failed} failed${skipMsg}\x1b[0m\n`);
 process.exit(failed > 0 ? 1 : 0);

@@ -7,7 +7,10 @@ import path from 'path';
 import { createReadStream, existsSync } from 'fs';
 import { createInterface } from 'readline';
 import os from 'os';
+import { fileURLToPath } from 'url';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const pkg = JSON.parse(await fs.readFile(path.join(__dirname, 'package.json'), 'utf8'));
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
 const HISTORY_FILE = path.join(CLAUDE_DIR, 'history.jsonl');
@@ -271,7 +274,7 @@ function formatMessageBlock(msg, opts = {}) {
 program
   .name('sessions')
   .description('Search and browse Claude Code session transcripts')
-  .version('1.0.0');
+  .version(pkg.version);
 
 program
   .command('list')
