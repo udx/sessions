@@ -1,6 +1,6 @@
 {
   "name": "@udx/sessions",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Search, browse, and export Claude Code session transcripts from the command line.",
   "main": "index.js",
   "type": "module",
