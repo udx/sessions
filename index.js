@@ -46,6 +46,14 @@ function extractTextContent(content) {
   return '';
 }
 
+function hasTextContent(content) {
+  if (typeof content === 'string') return content.trim().length > 0;
+  if (Array.isArray(content)) {
+    return content.some(block => block && block.type === 'text' && block.text && block.text.trim());
+  }
+  return false;
+}
+
 function truncate(text, maxLength = 80) {
   const oneLine = text.replace(/\n+/g, ' ').trim();
   if (oneLine.length <= maxLength) return oneLine;
@@ -239,36 +247,36 @@ function formatMessageBlock(msg, opts = {}) {
 
   if (msg.type === 'user') {
     const text = extractTextContent(msg.message?.content);
-    if (!text) return '';
+    if (!text || !text.trim()) return null;
     const header = c.bold.cyan('\u25b6 You') + c.dim(` ${ts}`);
     return header + '\n' + wrapText(text, termWidth);
   }
 
   if (msg.type === 'assistant') {
     const modelName = msg.message?.model || 'claude';
-    const header = c.bold.green('\u25c0 Claude') + c.dim(` (${modelName}) ${ts}`);
     const content = msg.message?.content;
-    let body = '';
+    const parts = [];
 
     if (typeof content === 'string') {
-      body = wrapText(content, termWidth);
+      if (content.trim()) parts.push(wrapText(content, termWidth));
     } else if (Array.isArray(content)) {
-      const parts = [];
       for (const block of content) {
-        if (block.type === 'text' && block.text) {
+        if (block.type === 'text' && block.text && block.text.trim()) {
           parts.push(wrapText(block.text, termWidth));
         } else if (block.type === 'tool_use' && !opts.noTools) {
           const inputStr = typeof block.input === 'string' ? block.input : JSON.stringify(block.input);
           parts.push(c.dim(`  \u{1f527} ${block.name}: ${truncate(inputStr, termWidth - 10)}`));
         }
       }
-      body = parts.join('\n');
     }
 
-    return header + '\n' + body;
+    if (parts.length === 0) return null;
+
+    const header = c.bold.green('\u25c0 Claude') + c.dim(` (${modelName}) ${ts}`);
+    return header + '\n' + parts.join('\n');
   }
 
-  return '';
+  return null;
 }
 
 program
@@ -335,13 +343,20 @@ program
   .option('-p, --project <path>', 'Filter by project path')
   .option('-n, --limit <n>', 'Max results', '10')
   .option('-C, --context <n>', 'Context lines around match', '1')
+  .option('--since <date>', 'Only search sessions modified since date (YYYY-MM-DD)')
   .option('--json', 'Output JSON')
   .action(async (query, opts) => {
-    const sessions = await getSessionFiles(opts.project);
+    let sessions = await getSessionFiles(opts.project);
     const limit = parseInt(opts.limit);
     const contextN = parseInt(opts.context);
     const lowerQuery = query.toLowerCase();
     const results = [];
+    const sessionMatchCounts = new Map();
+
+    if (opts.since) {
+      const since = new Date(opts.since);
+      sessions = sessions.filter(s => s.modifiedAt >= since);
+    }
 
     for (const session of sessions) {
       if (results.length >= limit * 3) break;
@@ -351,7 +366,10 @@ program
         const text = extractTextContent(data.message?.content);
         if (!text || !text.toLowerCase().includes(lowerQuery)) return;
 
-        const lines = text.split('\n');
+        const count = sessionMatchCounts.get(session.shortId) || 0;
+        sessionMatchCounts.set(session.shortId, count + 1);
+
+        const lines = text.split('\n').filter(l => l.trim());
         const matchLines = [];
         for (let i = 0; i < lines.length; i++) {
           if (lines[i].toLowerCase().includes(lowerQuery)) {
@@ -360,6 +378,7 @@ program
             const snippet = [];
             for (let j = start; j <= end; j++) {
               let l = lines[j];
+              if (l.length > 200) l = l.slice(0, 200) + '\u2026';
               if (j === i) {
                 l = l.replace(new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi'),
                   m => c.bold.yellow(m));
@@ -377,7 +396,7 @@ program
           timestamp: data.timestamp,
           type: data.type,
           model: data.message?.model,
-          snippets: matchLines.slice(0, 3)
+          snippets: matchLines.slice(0, 2)
         });
       });
     }
@@ -399,11 +418,14 @@ program
     for (const r of sorted) {
       const time = r.timestamp ? formatRelativeTime(r.timestamp) : '';
       const who = r.type === 'user' ? c.cyan('you') : c.green('claude');
+      const hitCount = sessionMatchCounts.get(r.shortId);
+      const hits = hitCount > 1 ? c.dim(` (${hitCount} hits)`) : '';
       console.log(
         c.yellow(r.shortId) + ' ' +
         c.dim(r.project) + ' ' +
         who + ' ' +
-        c.dim(time)
+        c.dim(time) +
+        hits
       );
       for (const snippet of r.snippets) {
         console.log('  ' + snippet.split('\n').map(l => '  ' + l).join('\n'));
@@ -434,6 +456,7 @@ program
     let idx = 0;
     const offset = parseInt(opts.offset);
     const limit = opts.limit ? parseInt(opts.limit) : Infinity;
+    const noTools = opts.tools === false;
 
     await streamLines(session.filePath, (data) => {
       if (data.type === 'summary') {
@@ -443,6 +466,10 @@ program
       if (data.type !== 'user' && data.type !== 'assistant') return;
       if (opts.userOnly && data.type !== 'user') return;
       if (opts.assistantOnly && data.type !== 'assistant') return;
+
+      if (opts.assistantOnly || noTools) {
+        if (!hasTextContent(data.message?.content)) return;
+      }
 
       idx++;
       if (idx <= offset) return;
@@ -459,9 +486,10 @@ program
     console.log(c.dim(`Project: ${session.project}`));
     console.log(c.dim(`Size: ${formatSize(session.size)}  Messages: ${messages.length}\n`));
 
+    const showOpts = { noTools: noTools || opts.assistantOnly };
     for (const msg of messages) {
-      const formatted = formatMessageBlock(msg, { noTools: opts.tools === false });
-      if (formatted) console.log(formatted + '\n');
+      const formatted = formatMessageBlock(msg, showOpts);
+      if (formatted !== null) console.log(formatted + '\n');
     }
   });
 
@@ -513,17 +541,23 @@ program
       }
     });
 
+    const contentMessages = messages.filter(msg => {
+      if (msg.type === 'summary') return true;
+      return hasTextContent(msg.message?.content);
+    });
+
     let output = '';
 
     if (opts.format === 'json') {
-      output = JSON.stringify(messages, null, 2);
+      output = JSON.stringify(contentMessages, null, 2);
     } else if (opts.format === 'text') {
-      for (const msg of messages) {
+      for (const msg of contentMessages) {
         if (msg.type === 'summary') {
           output += `[SUMMARY] ${msg.summary}\n\n`;
           continue;
         }
         const text = extractTextContent(msg.message?.content);
+        if (!text || !text.trim()) continue;
         const ts = msg.timestamp ? new Date(msg.timestamp).toISOString() : '';
         const who = msg.type === 'user' ? 'YOU' : 'CLAUDE';
         const model = msg.message?.model ? ` (${msg.message.model})` : '';
@@ -532,14 +566,15 @@ program
     } else {
       output += `# Session: ${session.sessionId}\n\n`;
       output += `**Project:** ${session.project}  \n`;
-      output += `**Messages:** ${messages.length}  \n\n---\n\n`;
+      output += `**Messages:** ${contentMessages.length}  \n\n---\n\n`;
 
-      for (const msg of messages) {
+      for (const msg of contentMessages) {
         if (msg.type === 'summary') {
           output += `> *Summary:* ${msg.summary}\n\n`;
           continue;
         }
         const text = extractTextContent(msg.message?.content);
+        if (!text || !text.trim()) continue;
         const ts = msg.timestamp ? formatRelativeTime(msg.timestamp) : '';
         const who = msg.type === 'user' ? '**You**' : '**Claude**';
         const model = msg.message?.model ? ` *(${msg.message.model})*` : '';
@@ -576,7 +611,7 @@ program
     if (opts.search) {
       const q = opts.search.toLowerCase();
       filtered = filtered.filter(e => {
-        const text = e.prompt || e.message || '';
+        const text = e.display || e.prompt || e.message || '';
         return text.toLowerCase().includes(q);
       });
     }
@@ -597,7 +632,7 @@ program
 
     for (const e of shown) {
       const time = e.timestamp ? formatRelativeTime(e.timestamp) : '';
-      const prompt = truncate(e.prompt || e.message || '(empty)', 100);
+      const prompt = truncate(e.display || e.prompt || e.message || '(empty)', 100);
       const proj = e.projectPath || e.project || '';
       console.log(c.cyan(time) + ' ' + c.dim(proj));
       console.log(`  ${prompt}\n`);

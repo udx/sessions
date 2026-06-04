@@ -25,6 +25,7 @@ sessions list --since 2026-01-01 --full
 ```bash
 sessions search "authentication bug"
 sessions search "refactor" -p my-project -C 3
+sessions search "deploy" --since 2026-05-01
 ```
 
 ### Show a session
@@ -64,7 +65,7 @@ All commands support `--json` for machine-readable output.
 |--------|----------|-------------|
 | `-p, --project <path>` | list, search | Filter by project path (substring match) |
 | `-n, --limit <n>` | list, search, show, history | Max results to display |
-| `--since <date>` | list | Only sessions modified after this date |
+| `--since <date>` | list, search | Only sessions modified after this date |
 | `--full` | list | Include full message counts (slower) |
 | `-C, --context <n>` | search | Context lines around each match |
 | `--user-only` | show | Show only user messages |
@@ -74,6 +75,17 @@ All commands support `--json` for machine-readable output.
 | `-f, --format <fmt>` | export | Output format: md, json, text |
 | `-o, --output <file>` | export | Write to file instead of stdout |
 | `-s, --search <query>` | history | Filter history by prompt text |
+
+## Changelog
+
+### 1.1.0
+- Fixed history command showing `(empty)` instead of prompt text
+- Fixed `--no-tools` leaving blank message shells
+- Fixed `--assistant-only` showing tool calls instead of text responses
+- Fixed export producing empty blocks for tool-only messages
+- Added `--since` date filter to search command
+- Added per-session hit counts in search results
+- Improved search output: truncated long lines, cleaner snippets
 
 ## How it works
 

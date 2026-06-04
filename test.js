@@ -142,13 +142,46 @@ testData('--user-only filter works', () => {
   assert(messages.every(m => m.type === 'user'), 'all should be user messages');
 });
 
-testData('--assistant-only filter works', () => {
+testData('--assistant-only shows only text messages', () => {
   const listOut = run('list --limit 1 --json');
   const sessions = JSON.parse(listOut);
   const shortId = sessions[0].shortId;
   const out = run(`show ${shortId} --assistant-only --limit 5 --json`);
   const messages = JSON.parse(out);
   assert(messages.every(m => m.type === 'assistant'), 'all should be assistant messages');
+  for (const m of messages) {
+    const content = m.message?.content;
+    if (Array.isArray(content)) {
+      const hasText = content.some(b => b.type === 'text' && b.text && b.text.trim());
+      assert(hasText, 'assistant-only messages should have text content');
+    }
+  }
+});
+
+testData('--no-tools hides empty tool-only messages', () => {
+  const listOut = run('list --limit 1 --json');
+  const sessions = JSON.parse(listOut);
+  const shortId = sessions[0].shortId;
+  const out = run(`show ${shortId} --no-tools --limit 10 --json`);
+  const messages = JSON.parse(out);
+  for (const m of messages) {
+    if (m.type === 'assistant') {
+      const content = m.message?.content;
+      if (Array.isArray(content)) {
+        const hasText = content.some(b => b.type === 'text' && b.text && b.text.trim());
+        assert(hasText, '--no-tools messages should have text content (not be empty)');
+      }
+    }
+  }
+});
+
+testData('--no-tools human-readable has no blank messages', () => {
+  const listOut = run('list --limit 1 --json');
+  const sessions = JSON.parse(listOut);
+  const shortId = sessions[0].shortId;
+  const out = run(`show ${shortId} --no-tools --limit 10`);
+  const emptyBlocks = (out.match(/Claude.*\n\n\n/g) || []).length;
+  assert(emptyBlocks === 0, `should have no empty Claude blocks, found ${emptyBlocks}`);
 });
 
 testData('human-readable show works', () => {
@@ -187,26 +220,46 @@ testData('search returns expected fields', () => {
   }
 });
 
+testData('search --since filters by date', () => {
+  const tomorrow = new Date(Date.now() + 86400000).toISOString().split('T')[0];
+  const out = run(`search "the" --since ${tomorrow} --limit 5 --json`, 60000);
+  const data = JSON.parse(out);
+  assert(Array.isArray(data), 'should be array');
+  assert(data.length === 0, 'future date should return no results');
+});
+
 testData('human-readable search works', () => {
   const out = run('search "session" --limit 3', 60000);
   assert(typeof out === 'string', 'should return string output');
 });
 
 console.log('\nexport command');
-testData('exports session as markdown', () => {
+testData('exports session as markdown without empty blocks', () => {
   const listOut = run('list --limit 1 --json');
   const sessions = JSON.parse(listOut);
   const shortId = sessions[0].shortId;
   const out = run(`export ${shortId} --format md`);
   assert(out.includes('# Session:'), 'should have markdown header');
+  const emptyBlocks = out.split('---').filter(block => {
+    const trimmed = block.trim();
+    return trimmed.startsWith('###') && trimmed.split('\n').filter(l => l.trim()).length <= 1;
+  });
+  assert(emptyBlocks.length === 0, `should have no empty export blocks, found ${emptyBlocks.length}`);
 });
 
-testData('exports session as text', () => {
+testData('exports session as text without empty entries', () => {
   const listOut = run('list --limit 1 --json');
   const sessions = JSON.parse(listOut);
   const shortId = sessions[0].shortId;
   const out = run(`export ${shortId} --format text`);
   assert(out.includes('[YOU]') || out.includes('[CLAUDE]'), 'should have text format markers');
+  const lines = out.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('[YOU]') || lines[i].startsWith('[CLAUDE]')) {
+      const nextLine = lines[i + 1] || '';
+      assert(nextLine.trim().length > 0, 'text export entries should not be empty');
+    }
+  }
 });
 
 testData('exports session as json', () => {
@@ -219,15 +272,36 @@ testData('exports session as json', () => {
 });
 
 console.log('\nhistory command');
-testData('shows history entries', () => {
+testData('shows history entries with display text', () => {
   const out = run('history --limit 5 --json');
   const data = JSON.parse(out);
   assert(Array.isArray(data), 'should be array');
 });
 
-testData('human-readable history works', () => {
+testData('history human-readable shows actual prompts (not empty)', () => {
   const out = run('history --limit 5');
   assert(typeof out === 'string', 'should return string');
+  const lines = out.split('\n').filter(l => l.trim());
+  const emptyCount = lines.filter(l => l.trim() === '(empty)').length;
+  const contentLines = lines.filter(l => l.startsWith('  ') && !l.includes('entries') && !l.includes('showing'));
+  if (contentLines.length > 0) {
+    assert(emptyCount < contentLines.length, 'most history entries should have content, not (empty)');
+  }
+});
+
+testData('history --search filters entries', () => {
+  const allOut = run('history --limit 50 --json');
+  const allData = JSON.parse(allOut);
+  if (allData.length > 0) {
+    const firstDisplay = allData[0].display || allData[0].prompt || allData[0].message || '';
+    if (firstDisplay.length > 3) {
+      const keyword = firstDisplay.slice(0, 10);
+      const filteredOut = run(`history --search "${keyword}" --limit 50 --json`);
+      const filteredData = JSON.parse(filteredOut);
+      assert(filteredData.length > 0, 'search should find matching entries');
+      assert(filteredData.length <= allData.length, 'filtered should be <= total');
+    }
+  }
 });
 
 const skipMsg = skipped > 0 ? `, ${skipped} skipped` : '';
