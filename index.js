@@ -55,9 +55,21 @@ function hasTextContent(content) {
 }
 
 function truncate(text, maxLength = 80) {
-  const oneLine = text.replace(/\n+/g, ' ').trim();
+  const oneLine = text.replace(/\n+/g, ' ').replace(/[#*`_~>|\-]{2,}/g, ' ').replace(/\s+/g, ' ').trim();
   if (oneLine.length <= maxLength) return oneLine;
   return oneLine.slice(0, maxLength - 1) + '\u2026';
+}
+
+function cleanSnippet(text) {
+  return text
+    .replace(/^```[\s\S]*?```$/gm, '[code block]')
+    .replace(/^\|.*\|$/gm, '')
+    .replace(/^[\s]*[-*] /gm, '  - ')
+    .replace(/#{1,6}\s+/g, '')
+    .replace(/\*{1,2}([^*]+)\*{1,2}/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 function formatSize(bytes) {
@@ -307,7 +319,7 @@ program
       const out = [];
       for (const s of shown) {
         const meta = opts.full ? await getSessionMeta(s.filePath) : await getSessionMetaFast(s.filePath);
-        out.push({ ...s, ...meta });
+        out.push({ ...s, ...meta, display: meta.firstPrompt || null });
       }
       console.log(JSON.stringify(out, null, 2));
       return;
@@ -342,7 +354,7 @@ program
   .description('Full-text search across session transcripts')
   .option('-p, --project <path>', 'Filter by project path')
   .option('-n, --limit <n>', 'Max results', '10')
-  .option('-C, --context <n>', 'Context lines around match', '1')
+  .option('-C, --context <n>', 'Context messages around match', '0')
   .option('--since <date>', 'Only search sessions modified since date (YYYY-MM-DD)')
   .option('--json', 'Output JSON')
   .action(async (query, opts) => {
@@ -352,6 +364,7 @@ program
     const lowerQuery = query.toLowerCase();
     const results = [];
     const sessionMatchCounts = new Map();
+    const sessionTotalCounts = new Map();
 
     if (opts.since) {
       const since = new Date(opts.since);
@@ -361,22 +374,35 @@ program
     for (const session of sessions) {
       if (results.length >= limit * 3) break;
 
+      const allMessages = [];
       await streamLines(session.filePath, (data) => {
-        if (data.type !== 'user' && data.type !== 'assistant') return;
-        const text = extractTextContent(data.message?.content);
-        if (!text || !text.toLowerCase().includes(lowerQuery)) return;
+        if (data.type === 'user' || data.type === 'assistant') {
+          allMessages.push(data);
+        }
+      });
 
+      let totalHits = 0;
+      for (let mi = 0; mi < allMessages.length; mi++) {
+        const data = allMessages[mi];
+        const text = extractTextContent(data.message?.content);
+        if (!text || !text.toLowerCase().includes(lowerQuery)) continue;
+
+        totalHits++;
         const count = sessionMatchCounts.get(session.shortId) || 0;
         sessionMatchCounts.set(session.shortId, count + 1);
 
-        const lines = text.split('\n').filter(l => l.trim());
+        const cleaned = cleanSnippet(text);
+        const lines = cleaned.split('\n').filter(l => l.trim());
         const matchLines = [];
+        const seen = new Set();
         for (let i = 0; i < lines.length; i++) {
           if (lines[i].toLowerCase().includes(lowerQuery)) {
-            const start = Math.max(0, i - contextN);
-            const end = Math.min(lines.length - 1, i + contextN);
+            const start = Math.max(0, i - 1);
+            const end = Math.min(lines.length - 1, i + 1);
             const snippet = [];
             for (let j = start; j <= end; j++) {
+              if (seen.has(j)) continue;
+              seen.add(j);
               let l = lines[j];
               if (l.length > 200) l = l.slice(0, 200) + '\u2026';
               if (j === i) {
@@ -385,7 +411,25 @@ program
               }
               snippet.push(l);
             }
-            matchLines.push(snippet.join('\n'));
+            if (snippet.length > 0) matchLines.push(snippet.join('\n'));
+          }
+        }
+
+        const contextMessages = [];
+        if (contextN > 0) {
+          const start = Math.max(0, mi - contextN);
+          const end = Math.min(allMessages.length - 1, mi + contextN);
+          for (let ci = start; ci <= end; ci++) {
+            if (ci === mi) continue;
+            const ctxData = allMessages[ci];
+            const ctxText = extractTextContent(ctxData.message?.content);
+            if (ctxText && ctxText.trim()) {
+              contextMessages.push({
+                type: ctxData.type,
+                text: truncate(ctxText, 150),
+                position: ci < mi ? 'before' : 'after'
+              });
+            }
           }
         }
 
@@ -396,9 +440,14 @@ program
           timestamp: data.timestamp,
           type: data.type,
           model: data.message?.model,
-          snippets: matchLines.slice(0, 2)
+          snippets: matchLines.slice(0, 2),
+          contextMessages
         });
-      });
+      }
+
+      if (totalHits > 0) {
+        sessionTotalCounts.set(session.shortId, totalHits);
+      }
     }
 
     const sorted = results.sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0)).slice(0, limit);
@@ -418,8 +467,9 @@ program
     for (const r of sorted) {
       const time = r.timestamp ? formatRelativeTime(r.timestamp) : '';
       const who = r.type === 'user' ? c.cyan('you') : c.green('claude');
-      const hitCount = sessionMatchCounts.get(r.shortId);
-      const hits = hitCount > 1 ? c.dim(` (${hitCount} hits)`) : '';
+      const totalInSession = sessionTotalCounts.get(r.shortId) || 0;
+      const shownInSession = sessionMatchCounts.get(r.shortId) || 0;
+      const hits = totalInSession > 1 ? c.dim(` (${shownInSession}/${totalInSession} matches)`) : '';
       console.log(
         c.yellow(r.shortId) + ' ' +
         c.dim(r.project) + ' ' +
@@ -427,8 +477,20 @@ program
         c.dim(time) +
         hits
       );
+      if (r.contextMessages) {
+        for (const ctx of r.contextMessages.filter(m => m.position === 'before')) {
+          const ctxWho = ctx.type === 'user' ? c.dim.cyan('  [you]') : c.dim.green('  [claude]');
+          console.log(ctxWho + c.dim(` ${ctx.text}`));
+        }
+      }
       for (const snippet of r.snippets) {
         console.log('  ' + snippet.split('\n').map(l => '  ' + l).join('\n'));
+      }
+      if (r.contextMessages) {
+        for (const ctx of r.contextMessages.filter(m => m.position === 'after')) {
+          const ctxWho = ctx.type === 'user' ? c.dim.cyan('  [you]') : c.dim.green('  [claude]');
+          console.log(ctxWho + c.dim(` ${ctx.text}`));
+        }
       }
       console.log('');
     }
@@ -440,6 +502,7 @@ program
   .option('--user-only', 'Show only user messages')
   .option('--assistant-only', 'Show only assistant messages')
   .option('--no-tools', 'Hide tool use blocks')
+  .option('--preview', 'Show first few user prompts only (quick overview)')
   .option('-n, --limit <n>', 'Max messages to show')
   .option('--offset <n>', 'Skip first N messages', '0')
   .option('--json', 'Output JSON')
@@ -455,16 +518,18 @@ program
     const messages = [];
     let idx = 0;
     const offset = parseInt(opts.offset);
-    const limit = opts.limit ? parseInt(opts.limit) : Infinity;
+    const previewMode = opts.preview;
+    const limit = opts.limit ? parseInt(opts.limit) : (previewMode ? 5 : Infinity);
     const noTools = opts.tools === false;
+    const filterUser = opts.userOnly || previewMode;
 
     await streamLines(session.filePath, (data) => {
       if (data.type === 'summary') {
-        if (!opts.userOnly && !opts.assistantOnly) messages.push(data);
+        if (!filterUser && !opts.assistantOnly) messages.push(data);
         return;
       }
       if (data.type !== 'user' && data.type !== 'assistant') return;
-      if (opts.userOnly && data.type !== 'user') return;
+      if (filterUser && data.type !== 'user') return;
       if (opts.assistantOnly && data.type !== 'assistant') return;
 
       if (opts.assistantOnly || noTools) {
@@ -485,6 +550,16 @@ program
     console.log(c.bold(`Session: ${session.sessionId}`));
     console.log(c.dim(`Project: ${session.project}`));
     console.log(c.dim(`Size: ${formatSize(session.size)}  Messages: ${messages.length}\n`));
+
+    if (previewMode) {
+      for (const msg of messages) {
+        const text = extractTextContent(msg.message?.content);
+        if (!text) continue;
+        const ts = msg.timestamp ? formatRelativeTime(msg.timestamp) : '';
+        console.log(c.cyan(`  ${ts}`) + `  ${truncate(text, 100)}`);
+      }
+      return;
+    }
 
     const showOpts = { noTools: noTools || opts.assistantOnly };
     for (const msg of messages) {

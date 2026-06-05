@@ -233,6 +233,40 @@ testData('human-readable search works', () => {
   assert(typeof out === 'string', 'should return string output');
 });
 
+testData('search -C shows context messages', () => {
+  const out = run('search "the" --limit 1 -C 1 --json', 60000);
+  const data = JSON.parse(out);
+  if (data.length > 0) {
+    assert(Array.isArray(data[0].contextMessages), 'should have contextMessages array');
+  }
+});
+
+testData('search shows occurrence counts in human output', () => {
+  const out = run('search "the" --limit 5', 60000);
+  assert(typeof out === 'string', 'should return string output');
+  assert(out.includes('matches'), 'should show match count header');
+});
+
+console.log('\nshow --preview');
+testData('--preview shows compact user prompts', () => {
+  const listOut = run('list --limit 1 --json');
+  const sessions = JSON.parse(listOut);
+  const shortId = sessions[0].shortId;
+  const out = run(`show ${shortId} --preview`);
+  assert(out.includes('Session:'), 'should show session header');
+  assert(!out.includes('Claude'), 'preview should not show Claude messages');
+});
+
+console.log('\nlist --json display field');
+testData('list --json includes display field', () => {
+  const out = run('list --limit 1 --json');
+  const data = JSON.parse(out);
+  assert(data[0].display !== undefined, 'should have display field');
+  if (data[0].firstPrompt) {
+    assert(data[0].display === data[0].firstPrompt, 'display should match firstPrompt');
+  }
+});
+
 console.log('\nexport command');
 testData('exports session as markdown without empty blocks', () => {
   const listOut = run('list --limit 1 --json');
