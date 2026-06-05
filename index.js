@@ -61,15 +61,16 @@ function truncate(text, maxLength = 80) {
 }
 
 function cleanSnippet(text) {
-  return text
-    .replace(/^```[\s\S]*?```$/gm, '[code block]')
-    .replace(/^\|.*\|$/gm, '')
-    .replace(/^[\s]*[-*] /gm, '  - ')
-    .replace(/#{1,6}\s+/g, '')
-    .replace(/\*{1,2}([^*]+)\*{1,2}/g, '$1')
-    .replace(/`([^`]+)`/g, '$1')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+  let cleaned = text;
+  cleaned = cleaned.replace(/```[\w]*\n[\s\S]*?\n```/g, '[code block]');
+  cleaned = cleaned.replace(/^\|.*\|$/gm, '');
+  cleaned = cleaned.replace(/^[\s]*[-*] /gm, '  - ');
+  cleaned = cleaned.replace(/#{1,6}\s+/g, '');
+  cleaned = cleaned.replace(/\*\*([^*]+)\*\*/g, '$1');
+  cleaned = cleaned.replace(/\*([^*]+)\*/g, '$1');
+  cleaned = cleaned.replace(/`([^`]+)`/g, '$1');
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+  return cleaned.trim();
 }
 
 function formatSize(bytes) {
@@ -468,8 +469,7 @@ program
       const time = r.timestamp ? formatRelativeTime(r.timestamp) : '';
       const who = r.type === 'user' ? c.cyan('you') : c.green('claude');
       const totalInSession = sessionTotalCounts.get(r.shortId) || 0;
-      const shownInSession = sessionMatchCounts.get(r.shortId) || 0;
-      const hits = totalInSession > 1 ? c.dim(` (${shownInSession}/${totalInSession} matches)`) : '';
+      const hits = totalInSession > 1 ? c.dim(` (${totalInSession} matches in session)`) : '';
       console.log(
         c.yellow(r.shortId) + ' ' +
         c.dim(r.project) + ' ' +
@@ -521,7 +521,7 @@ program
     const previewMode = opts.preview;
     const limit = opts.limit ? parseInt(opts.limit) : (previewMode ? 5 : Infinity);
     const noTools = opts.tools === false;
-    const filterUser = opts.userOnly || previewMode;
+    const filterUser = previewMode ? !opts.assistantOnly : opts.userOnly;
 
     await streamLines(session.filePath, (data) => {
       if (data.type === 'summary') {

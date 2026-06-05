@@ -24,17 +24,22 @@ sessions list --since 2026-01-01 --full
 
 ```bash
 sessions search "authentication bug"
-sessions search "refactor" -p my-project -C 3
+sessions search "refactor" -p my-project -C 2
 sessions search "deploy" --since 2026-05-01
 ```
+
+The `-C` flag shows surrounding conversation messages for context (not text lines within a message). Each context message is labeled `[you]` or `[claude]` so you can follow the conversation flow.
 
 ### Show a session
 
 ```bash
 sessions show a1b2c3d4
-sessions show a1b2c3d4 --user-only
+sessions show a1b2c3d4 --preview
+sessions show a1b2c3d4 --assistant-only
 sessions show a1b2c3d4 --no-tools -n 20
 ```
+
+The `--preview` flag shows a compact list of the first few prompts, useful for quickly understanding what a session was about. Combine with `--assistant-only` to preview Claude's responses instead.
 
 ### List projects
 
@@ -67,7 +72,8 @@ All commands support `--json` for machine-readable output.
 | `-n, --limit <n>` | list, search, show, history | Max results to display |
 | `--since <date>` | list, search | Only sessions modified after this date |
 | `--full` | list | Include full message counts (slower) |
-| `-C, --context <n>` | search | Context lines around each match |
+| `-C, --context <n>` | search | Surrounding conversation messages to show |
+| `--preview` | show | Show first few prompts as a compact overview |
 | `--user-only` | show | Show only user messages |
 | `--assistant-only` | show | Show only assistant messages |
 | `--no-tools` | show | Hide tool-use blocks |
@@ -76,7 +82,29 @@ All commands support `--json` for machine-readable output.
 | `-o, --output <file>` | export | Write to file instead of stdout |
 | `-s, --search <query>` | history | Filter history by prompt text |
 
+## JSON output
+
+The `--json` flag on `list` includes a `display` field (the first user prompt) for easy pipeline usage:
+
+```bash
+sessions list -n 5 --json | jq '.[].display'
+```
+
+Search results include `contextMessages` with `type`, `text`, and `position` fields when using `-C`.
+
 ## Changelog
+
+### 1.2.1
+- Fixed `--preview --assistant-only` conflict (preview no longer forces user-only)
+- Fixed `cleanSnippet` regex that corrupted search results for markdown-heavy content
+- Simplified match count display to `(N matches in session)`
+
+### 1.2.0
+- Added `--preview` flag for quick session overviews
+- Redesigned `-C` context to show surrounding conversation messages (not text lines)
+- Added `display` field to `list --json` output
+- Improved search snippet quality (strips markdown noise)
+- Improved occurrence count display per session
 
 ### 1.1.0
 - Fixed history command showing `(empty)` instead of prompt text
@@ -85,7 +113,6 @@ All commands support `--json` for machine-readable output.
 - Fixed export producing empty blocks for tool-only messages
 - Added `--since` date filter to search command
 - Added per-session hit counts in search results
-- Improved search output: truncated long lines, cleaner snippets
 
 ## How it works
 
