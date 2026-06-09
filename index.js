@@ -16,6 +16,13 @@ const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
 const HISTORY_FILE = path.join(CLAUDE_DIR, 'history.jsonl');
 const c = chalk;
 
+function daysToSinceDate(days) {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
 function formatRelativeTime(timestamp) {
   const now = new Date();
   const date = new Date(timestamp);
@@ -303,14 +310,16 @@ program
   .option('-p, --project <path>', 'Filter by project path (substring match)')
   .option('-n, --limit <n>', 'Max sessions to show', '20')
   .option('--since <date>', 'Sessions since date (YYYY-MM-DD)')
+  .option('--days <n>', 'Sessions from last N days')
   .option('--full', 'Show full message counts (slower)')
+  .option('--preview', 'Show first few prompts per session')
   .option('--json', 'Output JSON')
   .action(async (opts) => {
     let sessions = await getSessionFiles(opts.project);
     const limit = parseInt(opts.limit);
 
-    if (opts.since) {
-      const since = new Date(opts.since);
+    const since = opts.days ? daysToSinceDate(parseInt(opts.days)) : opts.since ? new Date(opts.since) : null;
+    if (since) {
       sessions = sessions.filter(s => s.modifiedAt >= since);
     }
 
@@ -335,7 +344,7 @@ program
 
     for (const s of shown) {
       const meta = opts.full ? await getSessionMeta(s.filePath) : await getSessionMetaFast(s.filePath);
-      const preview = meta.firstPrompt ? truncate(meta.firstPrompt, 90) : c.dim('(empty)');
+      const firstLine = meta.firstPrompt ? truncate(meta.firstPrompt, 90) : c.dim('(empty)');
       const time = formatRelativeTime(s.modifiedAt);
       const msgInfo = meta.messageCount ? `${meta.messageCount} msg` : '';
 
@@ -346,7 +355,28 @@ program
         (msgInfo ? c.dim(`(${msgInfo}) `) : '') +
         c.dim(formatSize(s.size))
       );
-      console.log(`  ${preview}\n`);
+
+      if (opts.preview) {
+        const prompts = [];
+        let count = 0;
+        await streamLines(s.filePath, (data) => {
+          if (data.type === 'user') {
+            const text = extractTextContent(data.message?.content);
+            if (text && text.trim()) {
+              const ts = data.timestamp ? formatRelativeTime(data.timestamp) : '';
+              prompts.push({ text: truncate(text, 100), time: ts });
+              count++;
+              if (count >= 5) return true;
+            }
+          }
+        });
+        for (const p of prompts) {
+          console.log(c.dim(`    ${p.time}`) + `  ${p.text}`);
+        }
+      } else {
+        console.log(`  ${firstLine}`);
+      }
+      console.log('');
     }
   });
 
@@ -357,6 +387,7 @@ program
   .option('-n, --limit <n>', 'Max results', '10')
   .option('-C, --context <n>', 'Context messages around match', '0')
   .option('--since <date>', 'Only search sessions modified since date (YYYY-MM-DD)')
+  .option('--days <n>', 'Only search sessions from last N days')
   .option('--json', 'Output JSON')
   .action(async (query, opts) => {
     let sessions = await getSessionFiles(opts.project);
@@ -367,8 +398,8 @@ program
     const sessionMatchCounts = new Map();
     const sessionTotalCounts = new Map();
 
-    if (opts.since) {
-      const since = new Date(opts.since);
+    const since = opts.days ? daysToSinceDate(parseInt(opts.days)) : opts.since ? new Date(opts.since) : null;
+    if (since) {
       sessions = sessions.filter(s => s.modifiedAt >= since);
     }
 
@@ -670,6 +701,7 @@ program
   .description('Show recent prompts from global history')
   .option('-n, --limit <n>', 'Max entries', '20')
   .option('-s, --search <query>', 'Filter by prompt text')
+  .option('--days <n>', 'Entries from last N days')
   .option('--json', 'Output JSON')
   .action(async (opts) => {
     if (!existsSync(HISTORY_FILE)) {
@@ -683,6 +715,13 @@ program
     });
 
     let filtered = entries.reverse();
+    if (opts.days) {
+      const since = daysToSinceDate(parseInt(opts.days));
+      filtered = filtered.filter(e => {
+        const ts = e.timestamp ? new Date(e.timestamp) : null;
+        return ts && ts >= since;
+      });
+    }
     if (opts.search) {
       const q = opts.search.toLowerCase();
       filtered = filtered.filter(e => {

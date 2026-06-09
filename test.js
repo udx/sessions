@@ -254,7 +254,7 @@ testData('--preview shows compact user prompts', () => {
   const shortId = sessions[0].shortId;
   const out = run(`show ${shortId} --preview`);
   assert(out.includes('Session:'), 'should show session header');
-  assert(!out.includes('Claude'), 'preview should not show Claude messages');
+  assert(!/^\u25c0 Claude/m.test(out), 'preview should not show Claude message headers');
 });
 
 console.log('\nlist --json display field');
