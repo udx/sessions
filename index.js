@@ -388,6 +388,7 @@ program
   .option('-C, --context <n>', 'Context messages around match', '0')
   .option('--since <date>', 'Only search sessions modified since date (YYYY-MM-DD)')
   .option('--days <n>', 'Only search sessions from last N days')
+  .option('--preview', 'Show first few prompts per matched session')
   .option('--json', 'Output JSON')
   .action(async (query, opts) => {
     let sessions = await getSessionFiles(opts.project);
@@ -473,7 +474,8 @@ program
           type: data.type,
           model: data.message?.model,
           snippets: matchLines.slice(0, 2),
-          contextMessages
+          contextMessages,
+          _filePath: session.filePath
         });
       }
 
@@ -485,7 +487,7 @@ program
     const sorted = results.sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0)).slice(0, limit);
 
     if (opts.json) {
-      console.log(JSON.stringify(sorted, null, 2));
+      console.log(JSON.stringify(sorted.map(({ _filePath, ...rest }) => rest), null, 2));
       return;
     }
 
@@ -495,6 +497,8 @@ program
     }
 
     console.log(c.bold(`${results.length} matches`) + c.dim(` (showing ${sorted.length})\n`));
+
+    const previewShown = new Set();
 
     for (const r of sorted) {
       const time = r.timestamp ? formatRelativeTime(r.timestamp) : '';
@@ -521,6 +525,28 @@ program
         for (const ctx of r.contextMessages.filter(m => m.position === 'after')) {
           const ctxWho = ctx.type === 'user' ? c.dim.cyan('  [you]') : c.dim.green('  [claude]');
           console.log(ctxWho + c.dim(` ${ctx.text}`));
+        }
+      }
+      if (opts.preview && !previewShown.has(r.shortId)) {
+        previewShown.add(r.shortId);
+        const prompts = [];
+        let count = 0;
+        await streamLines(r._filePath, (data) => {
+          if (data.type === 'user') {
+            const text = extractTextContent(data.message?.content);
+            if (text && text.trim()) {
+              const ts = data.timestamp ? formatRelativeTime(data.timestamp) : '';
+              prompts.push({ text: truncate(text, 100), time: ts });
+              count++;
+              if (count >= 5) return true;
+            }
+          }
+        });
+        if (prompts.length > 0) {
+          console.log(c.dim('  --- session prompts ---'));
+          for (const p of prompts) {
+            console.log(c.dim(`    ${p.time}`) + `  ${p.text}`);
+          }
         }
       }
       console.log('');
