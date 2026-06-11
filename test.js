@@ -338,6 +338,79 @@ testData('history --search filters entries', () => {
   }
 });
 
+console.log('\nproject filter (encoded names)');
+testData('--project matches encoded directory names', () => {
+  const projectsOut = run('projects --json');
+  const projects = JSON.parse(projectsOut);
+  const proj = projects
+    .filter(p => p.encoded !== p.path)
+    .sort((a, b) => b.encoded.length - a.encoded.length)[0];
+  if (proj) {
+    const filtered = run(`list --project "${proj.encoded}" --limit 50 --json`);
+    const filteredData = JSON.parse(filtered);
+    assert(filteredData.length > 0, 'should match by encoded directory name');
+    assert(filteredData.every(s => s.project.includes(proj.path)), 'all results should be from matching project');
+  }
+});
+
+testData('--project is case-insensitive', () => {
+  const allOut = run('list --limit 1 --json');
+  const all = JSON.parse(allOut);
+  if (all.length > 0) {
+    const project = all[0].project;
+    const upper = project.toUpperCase();
+    const filtered = run(`list --project "${upper}" --limit 5 --json`);
+    const filteredData = JSON.parse(filtered);
+    assert(filteredData.length > 0, 'case-insensitive match should find results');
+  }
+});
+
+console.log('\nrecap command');
+testData('recap returns JSON with expected fields', () => {
+  const out = run('recap --days 30 -n 2 --json', 60000);
+  const data = JSON.parse(out);
+  assert(Array.isArray(data), 'should be array');
+  if (data.length > 0) {
+    assert(data[0].sessionId, 'should have sessionId');
+    assert(data[0].shortId, 'should have shortId');
+    assert(data[0].project, 'should have project');
+    assert(typeof data[0].userCount === 'number', 'should have userCount');
+    assert(Array.isArray(data[0].prompts), 'should have prompts array');
+  }
+});
+
+testData('recap human-readable output works', () => {
+  const out = run('recap --days 30 -n 2', 60000);
+  assert(out.includes('Recap:'), 'should show recap header');
+});
+
+testData('recap --project filters correctly', () => {
+  const out = run('recap --days 30 -n 2 --json', 60000);
+  const all = JSON.parse(out);
+  if (all.length > 0) {
+    const project = all[0].project;
+    const filtered = run(`recap --project "${project}" --days 30 -n 10 --json`, 60000);
+    const filteredData = JSON.parse(filtered);
+    assert(filteredData.every(s => s.project.includes(project)), 'all should match project filter');
+  }
+});
+
+console.log('\nactivity command');
+testData('activity returns JSON with expected fields', () => {
+  const out = run('activity --days 30 -n 5 --json', 60000);
+  const data = JSON.parse(out);
+  assert(Array.isArray(data), 'should be array');
+  if (data.length > 0) {
+    assert(data[0].shortId, 'should have shortId');
+    assert(data[0].project, 'should have project');
+  }
+});
+
+testData('activity human-readable groups by project', () => {
+  const out = run('activity --days 30 -n 10', 60000);
+  assert(out.includes('Activity:'), 'should show activity header');
+});
+
 const skipMsg = skipped > 0 ? `, ${skipped} skipped` : '';
 console.log(`\n\x1b[${failed ? '31' : '32'}m${passed} passed, ${failed} failed${skipMsg}\x1b[0m\n`);
 process.exit(failed > 0 ? 1 : 0);

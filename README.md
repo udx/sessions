@@ -55,6 +55,25 @@ sessions export a1b2c3d4 -f json -o transcript.json
 sessions export a1b2c3d4 -f text
 ```
 
+### Recap recent work
+
+```bash
+sessions recap -p my-project
+sessions recap -p my-project --days 7 -n 5
+sessions recap --days 30 --prompts 5 --json
+```
+
+Shows recent sessions grouped by day with user prompts listed under each session. Designed for quickly answering "what have we been working on?"
+
+### Activity timeline
+
+```bash
+sessions activity
+sessions activity --days 14 -n 20
+```
+
+Shows a compact cross-project timeline grouped by project. Useful for getting a high-level view of where work has been happening.
+
 ### Browse prompt history
 
 ```bash
@@ -71,6 +90,7 @@ All commands support `--json` for machine-readable output.
 | `-p, --project <path>` | list, search | Filter by project path (substring match) |
 | `-n, --limit <n>` | list, search, show, history | Max results to display |
 | `--since <date>` | list, search | Only sessions modified after this date |
+| `--days <n>` | list, search, recap, activity | Sessions from last N days |
 | `--full` | list | Include full message counts (slower) |
 | `-C, --context <n>` | search | Surrounding conversation messages to show |
 | `--preview` | show | Show first few prompts as a compact overview |
@@ -80,6 +100,7 @@ All commands support `--json` for machine-readable output.
 | `--offset <n>` | show | Skip first N messages |
 | `-f, --format <fmt>` | export | Output format: md, json, text |
 | `-o, --output <file>` | export | Write to file instead of stdout |
+| `--prompts <n>` | recap | Max user prompts per session (default 8) |
 | `-s, --search <query>` | history | Filter history by prompt text |
 
 ## JSON output
@@ -93,6 +114,12 @@ sessions list -n 5 --json | jq '.[].display'
 Search results include `contextMessages` with `type`, `text`, and `position` fields when using `-C`.
 
 ## Changelog
+
+### 1.4.0
+- Added `recap` command for summarizing recent session activity by project, grouped by day
+- Added `activity` command for cross-project timeline view
+- Project filter (`-p`) now matches encoded directory names (e.g., `-opt-sources-www-udx-io`)
+- Project filter is now case-insensitive
 
 ### 1.2.1
 - Fixed `--preview --assistant-only` conflict (preview no longer forces user-only)

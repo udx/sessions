@@ -178,7 +178,12 @@ async function getSessionFiles(projectFilter = null) {
   const sessions = [];
 
   for (const project of projects) {
-    if (projectFilter && !project.path.includes(projectFilter)) continue;
+    if (projectFilter) {
+      const pf = projectFilter.toLowerCase();
+      const matchesDecoded = project.path.toLowerCase().includes(pf);
+      const matchesEncoded = project.encoded.toLowerCase().includes(pf);
+      if (!matchesDecoded && !matchesEncoded) continue;
+    }
 
     const projectDir = path.join(PROJECTS_DIR, project.encoded);
     const files = await fs.readdir(projectDir);
@@ -776,6 +781,165 @@ program
       const proj = e.projectPath || e.project || '';
       console.log(c.cyan(time) + ' ' + c.dim(proj));
       console.log(`  ${prompt}\n`);
+    }
+  });
+
+program
+  .command('recap')
+  .description('Summarize recent session activity for a project')
+  .option('-p, --project <path>', 'Filter by project path (substring match)')
+  .option('-n, --limit <n>', 'Max sessions to include', '10')
+  .option('--days <n>', 'Sessions from last N days', '14')
+  .option('--prompts <n>', 'Max user prompts per session', '8')
+  .option('--json', 'Output JSON')
+  .action(async (opts) => {
+    const days = parseInt(opts.days);
+    const since = daysToSinceDate(days);
+    let sessions = await getSessionFiles(opts.project);
+    sessions = sessions.filter(s => s.modifiedAt >= since);
+    const shown = sessions.slice(0, parseInt(opts.limit));
+
+    if (shown.length === 0) {
+      console.log(`No sessions in the last ${days} days.`);
+      return;
+    }
+
+    const maxPrompts = parseInt(opts.prompts);
+    const recaps = [];
+
+    for (const s of shown) {
+      const prompts = [];
+      let lastTimestamp = null;
+      let userCount = 0;
+      let assistantCount = 0;
+      let model = null;
+
+      await streamLines(s.filePath, (data) => {
+        if (data.type === 'user') {
+          userCount++;
+          const text = extractTextContent(data.message?.content);
+          if (text && text.trim()) {
+            if (prompts.length < maxPrompts) {
+              prompts.push({ text: text.trim(), timestamp: data.timestamp });
+            }
+          }
+          if (data.timestamp) lastTimestamp = data.timestamp;
+        } else if (data.type === 'assistant') {
+          assistantCount++;
+          if (!model && data.message?.model) model = data.message.model;
+          if (data.timestamp) lastTimestamp = data.timestamp;
+        }
+      });
+
+      recaps.push({
+        sessionId: s.sessionId,
+        shortId: s.shortId,
+        project: s.project,
+        size: s.size,
+        modifiedAt: s.modifiedAt,
+        model,
+        userCount,
+        assistantCount,
+        prompts
+      });
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify(recaps, null, 2));
+      return;
+    }
+
+    const byDay = new Map();
+    for (const r of recaps) {
+      const day = r.modifiedAt.toISOString().split('T')[0];
+      if (!byDay.has(day)) byDay.set(day, []);
+      byDay.get(day).push(r);
+    }
+
+    const projectLabel = opts.project || 'all projects';
+    console.log(c.bold(`Recap: ${shown.length} sessions`) + c.dim(` (last ${days} days, ${projectLabel})\n`));
+
+    for (const [day, daySessions] of byDay) {
+      const dayDate = new Date(day + 'T12:00:00');
+      const dayLabel = dayDate.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
+      console.log(c.bold.underline(dayLabel));
+
+      for (const r of daySessions) {
+        const msgCount = r.userCount + r.assistantCount;
+        const header = c.yellow(r.shortId) + ' ' +
+          c.dim(r.project) + ' ' +
+          c.dim(`${msgCount} msgs, ${formatSize(r.size)}`) +
+          (r.model ? c.dim(` (${r.model})`) : '');
+        console.log('\n  ' + header);
+
+        for (let i = 0; i < r.prompts.length; i++) {
+          const p = r.prompts[i];
+          const ts = p.timestamp ? formatRelativeTime(p.timestamp) : '';
+          const num = c.dim(`${i + 1}.`);
+          console.log(`    ${num} ${truncate(p.text, 110)}` + (ts ? c.dim(`  ${ts}`) : ''));
+        }
+        if (r.userCount > r.prompts.length) {
+          console.log(c.dim(`    ... and ${r.userCount - r.prompts.length} more prompts`));
+        }
+      }
+      console.log('');
+    }
+  });
+
+program
+  .command('activity')
+  .description('Show a compact timeline of recent work across all projects')
+  .option('--days <n>', 'Activity from last N days', '7')
+  .option('-n, --limit <n>', 'Max sessions', '30')
+  .option('--json', 'Output JSON')
+  .action(async (opts) => {
+    const days = parseInt(opts.days);
+    const since = daysToSinceDate(days);
+    let sessions = await getSessionFiles();
+    sessions = sessions.filter(s => s.modifiedAt >= since);
+    const shown = sessions.slice(0, parseInt(opts.limit));
+
+    if (shown.length === 0) {
+      console.log(`No activity in the last ${days} days.`);
+      return;
+    }
+
+    const activity = [];
+    for (const s of shown) {
+      const meta = await getSessionMetaFast(s.filePath);
+      activity.push({
+        shortId: s.shortId,
+        project: s.project,
+        modifiedAt: s.modifiedAt,
+        size: s.size,
+        firstPrompt: meta.firstPrompt,
+        model: meta.model
+      });
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify(activity, null, 2));
+      return;
+    }
+
+    const byProject = new Map();
+    for (const a of activity) {
+      if (!byProject.has(a.project)) byProject.set(a.project, []);
+      byProject.get(a.project).push(a);
+    }
+
+    console.log(c.bold(`Activity: ${shown.length} sessions across ${byProject.size} projects`) + c.dim(` (last ${days} days)\n`));
+
+    for (const [project, projectSessions] of byProject) {
+      const totalSize = projectSessions.reduce((sum, s) => sum + s.size, 0);
+      console.log(c.cyan.bold(project) + c.dim(` - ${projectSessions.length} sessions, ${formatSize(totalSize)}`));
+
+      for (const s of projectSessions) {
+        const time = formatRelativeTime(s.modifiedAt);
+        const prompt = s.firstPrompt ? truncate(s.firstPrompt, 90) : c.dim('(empty)');
+        console.log(`  ${c.yellow(s.shortId)} ${c.dim(time)}  ${prompt}`);
+      }
+      console.log('');
     }
   });
 
