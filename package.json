@@ -1,18 +1,19 @@
 {
   "name": "@udx/sessions",
-  "version": "1.4.0",
-  "description": "Search, browse, and export Claude Code session transcripts from the command line.",
+  "version": "1.5.0",
+  "description": "Search, browse, and export Claude Code and Codex session transcripts from the command line.",
   "main": "index.js",
   "type": "module",
   "bin": {
     "sessions": "index.js"
   },
   "scripts": {
-    "test": "node test.js"
+    "test": "node test.js && node test-dual-source.js"
   },
   "keywords": [
     "claude",
     "claude-code",
+    "codex",
     "sessions",
     "transcripts",
     "search",

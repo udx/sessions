@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { program } from 'commander';
+import { InvalidArgumentError, program } from 'commander';
 import chalk from 'chalk';
 import fs from 'fs/promises';
 import path from 'path';
@@ -11,10 +11,35 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(await fs.readFile(path.join(__dirname, 'package.json'), 'utf8'));
-const CLAUDE_DIR = path.join(os.homedir(), '.claude');
+const CLAUDE_DIR = process.env.SESSIONS_CLAUDE_DIR || process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+const CODEX_DIR = process.env.SESSIONS_CODEX_DIR || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
-const HISTORY_FILE = path.join(CLAUDE_DIR, 'history.jsonl');
+const CLAUDE_HISTORY_FILE = path.join(CLAUDE_DIR, 'history.jsonl');
+const CODEX_SESSIONS_DIR = path.join(CODEX_DIR, 'sessions');
+const CODEX_ARCHIVED_SESSIONS_DIR = path.join(CODEX_DIR, 'archived_sessions');
+const CODEX_HISTORY_FILE = path.join(CODEX_DIR, 'history.jsonl');
+const VALID_SOURCES = new Set(['all', 'claude', 'codex']);
 const c = chalk;
+
+function parseSource(value) {
+  const source = String(value || 'all').toLowerCase();
+  if (!VALID_SOURCES.has(source)) {
+    throw new InvalidArgumentError('source must be one of: all, claude, codex');
+  }
+  return source;
+}
+
+function sourceTag(source) {
+  return source === 'codex' ? c.magenta('[codex]') : c.blue('[claude]');
+}
+
+function speakerName(source) {
+  return source === 'codex' ? 'Codex' : 'Claude';
+}
+
+function sessionKey(session) {
+  return `${session.source}:${session.sessionId}`;
+}
 
 function daysToSinceDate(days) {
   const d = new Date();
@@ -127,7 +152,7 @@ async function streamLines(filePath, callback) {
   }
 }
 
-async function resolveProjectPath(encodedDir) {
+async function resolveClaudeProjectPath(encodedDir) {
   const projectDir = path.join(PROJECTS_DIR, encodedDir);
   const files = await fs.readdir(projectDir);
   const firstSession = files.find(f => f.endsWith('.jsonl'));
@@ -140,7 +165,7 @@ async function resolveProjectPath(encodedDir) {
   return cwd || encodedDir;
 }
 
-async function getAllProjects() {
+async function getClaudeProjects() {
   if (!existsSync(PROJECTS_DIR)) return [];
   const entries = await fs.readdir(PROJECTS_DIR);
   const projects = [];
@@ -160,11 +185,12 @@ async function getAllProjects() {
       if (s) totalSize += s.size;
     }
 
-    const decoded = await resolveProjectPath(entry);
+    const decoded = await resolveClaudeProjectPath(entry);
 
     projects.push({
       encoded: entry,
       path: decoded,
+      source: 'claude',
       sessionCount: sessionFiles.length,
       totalSize
     });
@@ -173,8 +199,13 @@ async function getAllProjects() {
   return projects.sort((a, b) => a.path.localeCompare(b.path));
 }
 
-async function getSessionFiles(projectFilter = null) {
-  const projects = await getAllProjects();
+function makeShortId(source, sessionId) {
+  const compact = String(sessionId || '').replace(/-/g, '');
+  return source === 'codex' ? compact.slice(0, 12) : compact.slice(0, 8);
+}
+
+async function getClaudeSessionFiles(projectFilter = null) {
+  const projects = await getClaudeProjects();
   const sessions = [];
 
   for (const project of projects) {
@@ -197,7 +228,8 @@ async function getSessionFiles(projectFilter = null) {
 
       sessions.push({
         sessionId,
-        shortId: sessionId.slice(0, 8),
+        shortId: makeShortId('claude', sessionId),
+        source: 'claude',
         project: project.path,
         projectEncoded: project.encoded,
         filePath,
@@ -210,14 +242,264 @@ async function getSessionFiles(projectFilter = null) {
   return sessions.sort((a, b) => b.modifiedAt - a.modifiedAt);
 }
 
-async function getSessionMeta(filePath) {
+async function findJsonlFiles(rootDir) {
+  if (!existsSync(rootDir)) return [];
+  const files = [];
+  const pending = [rootDir];
+
+  while (pending.length > 0) {
+    const dir = pending.pop();
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) pending.push(fullPath);
+      else if (entry.isFile() && entry.name.endsWith('.jsonl')) files.push(fullPath);
+    }
+  }
+
+  return files;
+}
+
+function sessionIdFromCodexFilename(filePath) {
+  const match = path.basename(filePath).match(/([0-9a-f]{8}-[0-9a-f-]{27,})\.jsonl$/i);
+  return match ? match[1] : path.basename(filePath, '.jsonl').replace(/^rollout-[^-]+-/, '');
+}
+
+async function getCodexSessionDescriptor(filePath, archived = false) {
+  const stat = await fs.stat(filePath).catch(() => null);
+  if (!stat) return null;
+
+  const filenameSessionId = sessionIdFromCodexFilename(filePath);
+  let sessionId = null;
+  let project = null;
+  let startedAt = null;
+  await streamLines(filePath, (data) => {
+    if (data.type === 'session_meta' && data.payload) {
+      const candidateId = data.payload.id || data.payload.session_id;
+      const isCanonical = candidateId && filenameSessionId && candidateId === filenameSessionId;
+      if (!sessionId || isCanonical) {
+        sessionId = candidateId || sessionId;
+        project = data.payload.cwd || project;
+        startedAt = data.payload.timestamp || data.timestamp || startedAt;
+      }
+      if (isCanonical && project) return true;
+    } else if (data.type === 'turn_context' && data.payload) {
+      project = data.payload.cwd || project;
+    }
+  });
+
+  sessionId = filenameSessionId || sessionId;
+  project ||= '(unknown)';
+  if (!sessionId) return null;
+
+  return {
+    sessionId,
+    shortId: makeShortId('codex', sessionId),
+    source: 'codex',
+    project,
+    projectEncoded: project,
+    filePath,
+    size: stat.size,
+    modifiedAt: stat.mtime,
+    startedAt,
+    archived
+  };
+}
+
+async function getCodexSessionFiles(projectFilter = null) {
+  const activeFiles = await findJsonlFiles(CODEX_SESSIONS_DIR);
+  const archivedFiles = await findJsonlFiles(CODEX_ARCHIVED_SESSIONS_DIR);
+  const descriptors = [];
+  for (const file of activeFiles) descriptors.push(await getCodexSessionDescriptor(file, false));
+  for (const file of archivedFiles) descriptors.push(await getCodexSessionDescriptor(file, true));
+  const filter = projectFilter ? projectFilter.toLowerCase() : null;
+  const byId = new Map();
+
+  for (const session of descriptors) {
+    if (!session) continue;
+    if (filter && !session.project.toLowerCase().includes(filter)) continue;
+    const existing = byId.get(session.sessionId);
+    const shouldReplace = !existing ||
+      (existing.archived && !session.archived) ||
+      (existing.archived === session.archived && session.modifiedAt > existing.modifiedAt);
+    if (shouldReplace) {
+      byId.set(session.sessionId, session);
+    }
+  }
+
+  return [...byId.values()].sort((a, b) => b.modifiedAt - a.modifiedAt);
+}
+
+async function getSessionFiles(projectFilter = null, source = 'all') {
+  const selected = parseSource(source);
+  const groups = await Promise.all([
+    selected !== 'codex' ? getClaudeSessionFiles(projectFilter) : [],
+    selected !== 'claude' ? getCodexSessionFiles(projectFilter) : []
+  ]);
+  return groups.flat().sort((a, b) => b.modifiedAt - a.modifiedAt);
+}
+
+async function getAllProjects(source = 'all') {
+  const selected = parseSource(source);
+  const claudeProjects = selected !== 'codex' ? await getClaudeProjects() : [];
+  const codexSessions = selected !== 'claude' ? await getCodexSessionFiles() : [];
+  const codexByProject = new Map();
+
+  for (const session of codexSessions) {
+    const current = codexByProject.get(session.project) || {
+      encoded: session.project,
+      path: session.project,
+      source: 'codex',
+      sessionCount: 0,
+      totalSize: 0
+    };
+    current.sessionCount++;
+    current.totalSize += session.size;
+    codexByProject.set(session.project, current);
+  }
+
+  const combined = [...claudeProjects, ...codexByProject.values()];
+  if (selected !== 'all') return combined.sort((a, b) => a.path.localeCompare(b.path));
+
+  const merged = new Map();
+  for (const project of combined) {
+    const current = merged.get(project.path) || {
+      encoded: project.encoded,
+      path: project.path,
+      source: project.source,
+      sources: {},
+      sessionCount: 0,
+      totalSize: 0
+    };
+    current.sources[project.source] = (current.sources[project.source] || 0) + project.sessionCount;
+    current.sessionCount += project.sessionCount;
+    current.totalSize += project.totalSize;
+    if (current.source !== project.source) current.source = 'all';
+    if (project.source === 'claude') current.encoded = project.encoded;
+    merged.set(project.path, current);
+  }
+  return [...merged.values()].sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function codexTextBlocks(content) {
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter(block => block && ['input_text', 'output_text', 'text'].includes(block.type) && typeof block.text === 'string')
+    .map(block => ({ type: 'text', text: block.text }));
+}
+
+function isInternalCodexUserText(text) {
+  return /^<environment_context>[\s\S]*<\/environment_context>$/.test(text.trim());
+}
+
+function parseToolInput(value) {
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(value); } catch { return value; }
+}
+
+function normalizeCodexRecord(data, state) {
+  if (data.type === 'turn_context' && data.payload?.model) state.model = data.payload.model;
+
+  if (data.type === 'event_msg') {
+    const role = data.payload?.type === 'user_message' ? 'user' : data.payload?.type === 'agent_message' ? 'assistant' : null;
+    const text = data.payload?.message;
+    if (role && typeof text === 'string' && text.trim()) {
+      return [{
+        type: role,
+        source: 'codex',
+        _representation: 'event',
+        timestamp: data.timestamp,
+        message: { role, model: role === 'assistant' ? state.model : undefined, content: [{ type: 'text', text }] }
+      }];
+    }
+  }
+
+  if (data.type === 'response_item' && data.payload?.type === 'message') {
+    const role = data.payload.role;
+    if (role !== 'user' && role !== 'assistant') return [];
+    const content = codexTextBlocks(data.payload.content);
+    if (content.length === 0) return [];
+    if (role === 'user' && content.every(block => isInternalCodexUserText(block.text))) return [];
+    return [{
+      type: role,
+      source: 'codex',
+      _representation: 'response',
+      timestamp: data.timestamp,
+      message: { role, model: role === 'assistant' ? state.model : undefined, content }
+    }];
+  }
+
+  if (data.type === 'response_item' && ['function_call', 'custom_tool_call'].includes(data.payload?.type)) {
+    const input = data.payload.type === 'function_call' ? data.payload.arguments : data.payload.input;
+    return [{
+      type: 'assistant',
+      source: 'codex',
+      _representation: 'tool',
+      timestamp: data.timestamp,
+      message: {
+        role: 'assistant',
+        model: state.model,
+        content: [{ type: 'tool_use', name: data.payload.name || data.payload.type, input: parseToolInput(input) }]
+      }
+    }];
+  }
+
+  return [];
+}
+
+async function streamSessionMessages(session, callback) {
+  if (session.source === 'claude') {
+    await streamLines(session.filePath, (data) => {
+      if (!['user', 'assistant', 'summary'].includes(data.type)) return;
+      return callback({ ...data, source: 'claude' });
+    });
+    return;
+  }
+
+  const state = { model: null };
+  let pending = null;
+  let stopped = false;
+
+  const emit = (message) => {
+    const { _representation, ...normalized } = message;
+    if (callback(normalized) === true) {
+      stopped = true;
+      return true;
+    }
+    return false;
+  };
+
+  await streamLines(session.filePath, (data) => {
+    const messages = normalizeCodexRecord(data, state);
+    for (const message of messages) {
+      const pendingText = pending ? extractTextContent(pending.message?.content) : '';
+      const messageText = extractTextContent(message.message?.content);
+      const isDuplicatePair = pending &&
+        pending.type === message.type &&
+        pendingText && pendingText === messageText &&
+        pending._representation !== message._representation &&
+        [pending._representation, message._representation].every(kind => ['event', 'response'].includes(kind));
+
+      if (isDuplicatePair) {
+        if (message._representation === 'event') pending = message;
+        continue;
+      }
+
+      if (pending && emit(pending)) return true;
+      pending = message;
+    }
+  });
+  if (!stopped && pending) emit(pending);
+}
+
+async function getSessionMeta(session) {
   let firstPrompt = null;
   let timestamp = null;
   let userCount = 0;
   let assistantCount = 0;
   let model = null;
 
-  await streamLines(filePath, (data) => {
+  await streamSessionMessages(session, (data) => {
     if (data.type === 'user') {
       userCount++;
       if (!firstPrompt) {
@@ -234,12 +516,12 @@ async function getSessionMeta(filePath) {
   return { firstPrompt, timestamp, userCount, assistantCount, model, messageCount: userCount + assistantCount };
 }
 
-async function getSessionMetaFast(filePath) {
+async function getSessionMetaFast(session) {
   let firstPrompt = null;
   let timestamp = null;
   let model = null;
 
-  await streamLines(filePath, (data) => {
+  await streamSessionMessages(session, (data) => {
     if (data.type === 'user' && !firstPrompt) {
       const text = extractTextContent(data.message?.content);
       if (text) firstPrompt = text;
@@ -254,12 +536,67 @@ async function getSessionMetaFast(filePath) {
   return { firstPrompt, timestamp, model };
 }
 
-function findSession(sessions, idFragment) {
-  return sessions.find(s =>
-    s.sessionId === idFragment ||
-    s.sessionId.startsWith(idFragment) ||
-    s.shortId === idFragment
-  );
+function timestampDate(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const normalized = typeof value === 'number' && value < 1e12 ? value * 1000 : value;
+  const date = new Date(normalized);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+async function getHistoryEntries(source = 'all') {
+  const selected = parseSource(source);
+  const entries = [];
+
+  if (selected !== 'codex' && existsSync(CLAUDE_HISTORY_FILE)) {
+    await streamLines(CLAUDE_HISTORY_FILE, (data) => {
+      entries.push({ ...data, source: 'claude' });
+    });
+  }
+
+  if (selected !== 'claude' && existsSync(CODEX_HISTORY_FILE)) {
+    const codexSessions = await getCodexSessionFiles();
+    const sessionsById = new Map(codexSessions.map(session => [session.sessionId, session]));
+    await streamLines(CODEX_HISTORY_FILE, (data) => {
+      if (typeof data.text !== 'string') return;
+      const session = sessionsById.get(data.session_id);
+      const timestamp = timestampDate(data.ts)?.toISOString() || null;
+      entries.push({
+        source: 'codex',
+        sessionId: data.session_id || null,
+        timestamp,
+        projectPath: session?.project || '',
+        display: data.text
+      });
+    });
+  }
+
+  return entries.sort((a, b) => {
+    const aTime = timestampDate(a.timestamp || a.ts)?.getTime() || 0;
+    const bTime = timestampDate(b.timestamp || b.ts)?.getTime() || 0;
+    return bTime - aTime;
+  });
+}
+
+function findSessions(sessions, rawIdFragment) {
+  let idFragment = rawIdFragment;
+  let source = null;
+  const qualified = rawIdFragment.match(/^(claude|codex):(.+)$/i);
+  if (qualified) {
+    source = qualified[1].toLowerCase();
+    idFragment = qualified[2];
+  }
+  const candidates = source ? sessions.filter(s => s.source === source) : sessions;
+  const exact = candidates.filter(s => s.sessionId === idFragment || s.shortId === idFragment);
+  if (exact.length > 0) return exact;
+  return candidates.filter(s => s.sessionId.startsWith(idFragment));
+}
+
+function resolveSession(sessions, idFragment) {
+  const matches = findSessions(sessions, idFragment);
+  if (matches.length === 1) return matches[0];
+  if (matches.length === 0) return null;
+  const choices = matches.map(s => `${s.source}:${s.sessionId}`).join(', ');
+  throw new Error(`Ambiguous session ID "${idFragment}". Use --source or a qualified ID: ${choices}`);
 }
 
 function formatMessageBlock(msg, opts = {}) {
@@ -278,7 +615,7 @@ function formatMessageBlock(msg, opts = {}) {
   }
 
   if (msg.type === 'assistant') {
-    const modelName = msg.message?.model || 'claude';
+    const modelName = msg.message?.model || msg.source || 'assistant';
     const content = msg.message?.content;
     const parts = [];
 
@@ -297,7 +634,7 @@ function formatMessageBlock(msg, opts = {}) {
 
     if (parts.length === 0) return null;
 
-    const header = c.bold.green('\u25c0 Claude') + c.dim(` (${modelName}) ${ts}`);
+    const header = c.bold.green(`\u25c0 ${speakerName(msg.source)}`) + c.dim(` (${modelName}) ${ts}`);
     return header + '\n' + parts.join('\n');
   }
 
@@ -306,7 +643,7 @@ function formatMessageBlock(msg, opts = {}) {
 
 program
   .name('sessions')
-  .description('Search and browse Claude Code session transcripts')
+  .description('Search and browse Claude Code and Codex session transcripts')
   .version(pkg.version);
 
 program
@@ -318,9 +655,10 @@ program
   .option('--days <n>', 'Sessions from last N days')
   .option('--full', 'Show full message counts (slower)')
   .option('--preview', 'Show first few prompts per session')
+  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (opts) => {
-    let sessions = await getSessionFiles(opts.project);
+    let sessions = await getSessionFiles(opts.project, opts.source);
     const limit = parseInt(opts.limit);
 
     const since = opts.days ? daysToSinceDate(parseInt(opts.days)) : opts.since ? new Date(opts.since) : null;
@@ -333,7 +671,7 @@ program
     if (opts.json) {
       const out = [];
       for (const s of shown) {
-        const meta = opts.full ? await getSessionMeta(s.filePath) : await getSessionMetaFast(s.filePath);
+        const meta = opts.full ? await getSessionMeta(s) : await getSessionMetaFast(s);
         out.push({ ...s, ...meta, display: meta.firstPrompt || null });
       }
       console.log(JSON.stringify(out, null, 2));
@@ -348,13 +686,14 @@ program
     console.log(c.bold(`${sessions.length} sessions`) + c.dim(` (showing ${shown.length})\n`));
 
     for (const s of shown) {
-      const meta = opts.full ? await getSessionMeta(s.filePath) : await getSessionMetaFast(s.filePath);
+      const meta = opts.full ? await getSessionMeta(s) : await getSessionMetaFast(s);
       const firstLine = meta.firstPrompt ? truncate(meta.firstPrompt, 90) : c.dim('(empty)');
       const time = formatRelativeTime(s.modifiedAt);
       const msgInfo = meta.messageCount ? `${meta.messageCount} msg` : '';
 
       console.log(
         c.yellow(s.shortId) + ' ' +
+        sourceTag(s.source) + ' ' +
         c.dim(s.project) + ' ' +
         c.cyan(time) + ' ' +
         (msgInfo ? c.dim(`(${msgInfo}) `) : '') +
@@ -364,7 +703,7 @@ program
       if (opts.preview) {
         const prompts = [];
         let count = 0;
-        await streamLines(s.filePath, (data) => {
+        await streamSessionMessages(s, (data) => {
           if (data.type === 'user') {
             const text = extractTextContent(data.message?.content);
             if (text && text.trim()) {
@@ -394,9 +733,10 @@ program
   .option('--since <date>', 'Only search sessions modified since date (YYYY-MM-DD)')
   .option('--days <n>', 'Only search sessions from last N days')
   .option('--preview', 'Show first few prompts per matched session')
+  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (query, opts) => {
-    let sessions = await getSessionFiles(opts.project);
+    let sessions = await getSessionFiles(opts.project, opts.source);
     const limit = parseInt(opts.limit);
     const contextN = parseInt(opts.context);
     const lowerQuery = query.toLowerCase();
@@ -413,7 +753,7 @@ program
       if (results.length >= limit * 3) break;
 
       const allMessages = [];
-      await streamLines(session.filePath, (data) => {
+      await streamSessionMessages(session, (data) => {
         if (data.type === 'user' || data.type === 'assistant') {
           allMessages.push(data);
         }
@@ -426,8 +766,9 @@ program
         if (!text || !text.toLowerCase().includes(lowerQuery)) continue;
 
         totalHits++;
-        const count = sessionMatchCounts.get(session.shortId) || 0;
-        sessionMatchCounts.set(session.shortId, count + 1);
+        const key = sessionKey(session);
+        const count = sessionMatchCounts.get(key) || 0;
+        sessionMatchCounts.set(key, count + 1);
 
         const cleaned = cleanSnippet(text);
         const lines = cleaned.split('\n').filter(l => l.trim());
@@ -474,25 +815,26 @@ program
         results.push({
           sessionId: session.sessionId,
           shortId: session.shortId,
+          source: session.source,
           project: session.project,
           timestamp: data.timestamp,
           type: data.type,
           model: data.message?.model,
           snippets: matchLines.slice(0, 2),
           contextMessages,
-          _filePath: session.filePath
+          _session: session
         });
       }
 
       if (totalHits > 0) {
-        sessionTotalCounts.set(session.shortId, totalHits);
+        sessionTotalCounts.set(sessionKey(session), totalHits);
       }
     }
 
     const sorted = results.sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0)).slice(0, limit);
 
     if (opts.json) {
-      console.log(JSON.stringify(sorted.map(({ _filePath, ...rest }) => rest), null, 2));
+      console.log(JSON.stringify(sorted.map(({ _session, ...rest }) => rest), null, 2));
       return;
     }
 
@@ -507,11 +849,12 @@ program
 
     for (const r of sorted) {
       const time = r.timestamp ? formatRelativeTime(r.timestamp) : '';
-      const who = r.type === 'user' ? c.cyan('you') : c.green('claude');
-      const totalInSession = sessionTotalCounts.get(r.shortId) || 0;
+      const who = r.type === 'user' ? c.cyan('you') : c.green(r.source);
+      const totalInSession = sessionTotalCounts.get(sessionKey(r)) || 0;
       const hits = totalInSession > 1 ? c.dim(` (${totalInSession} matches in session)`) : '';
       console.log(
         c.yellow(r.shortId) + ' ' +
+        sourceTag(r.source) + ' ' +
         c.dim(r.project) + ' ' +
         who + ' ' +
         c.dim(time) +
@@ -519,7 +862,7 @@ program
       );
       if (r.contextMessages) {
         for (const ctx of r.contextMessages.filter(m => m.position === 'before')) {
-          const ctxWho = ctx.type === 'user' ? c.dim.cyan('  [you]') : c.dim.green('  [claude]');
+          const ctxWho = ctx.type === 'user' ? c.dim.cyan('  [you]') : c.dim.green(`  [${r.source}]`);
           console.log(ctxWho + c.dim(` ${ctx.text}`));
         }
       }
@@ -528,15 +871,15 @@ program
       }
       if (r.contextMessages) {
         for (const ctx of r.contextMessages.filter(m => m.position === 'after')) {
-          const ctxWho = ctx.type === 'user' ? c.dim.cyan('  [you]') : c.dim.green('  [claude]');
+          const ctxWho = ctx.type === 'user' ? c.dim.cyan('  [you]') : c.dim.green(`  [${r.source}]`);
           console.log(ctxWho + c.dim(` ${ctx.text}`));
         }
       }
-      if (opts.preview && !previewShown.has(r.shortId)) {
-        previewShown.add(r.shortId);
+      if (opts.preview && !previewShown.has(sessionKey(r))) {
+        previewShown.add(sessionKey(r));
         const prompts = [];
         let count = 0;
-        await streamLines(r._filePath, (data) => {
+        await streamSessionMessages(r._session, (data) => {
           if (data.type === 'user') {
             const text = extractTextContent(data.message?.content);
             if (text && text.trim()) {
@@ -567,10 +910,21 @@ program
   .option('--preview', 'Show first few user prompts only (quick overview)')
   .option('-n, --limit <n>', 'Max messages to show')
   .option('--offset <n>', 'Skip first N messages', '0')
+  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (sessionId, opts) => {
-    const sessions = await getSessionFiles();
-    const session = findSession(sessions, sessionId);
+    if (opts.userOnly && opts.assistantOnly) {
+      console.error(c.red('--user-only and --assistant-only cannot be used together.'));
+      process.exit(1);
+    }
+    const sessions = await getSessionFiles(null, opts.source);
+    let session;
+    try {
+      session = resolveSession(sessions, sessionId);
+    } catch (error) {
+      console.error(c.red(error.message));
+      process.exit(1);
+    }
 
     if (!session) {
       console.error(c.red(`Session not found: ${sessionId}`));
@@ -585,7 +939,7 @@ program
     const noTools = opts.tools === false;
     const filterUser = previewMode ? !opts.assistantOnly : opts.userOnly;
 
-    await streamLines(session.filePath, (data) => {
+    await streamSessionMessages(session, (data) => {
       if (data.type === 'summary') {
         if (!filterUser && !opts.assistantOnly) messages.push(data);
         return;
@@ -610,6 +964,7 @@ program
     }
 
     console.log(c.bold(`Session: ${session.sessionId}`));
+    console.log(c.dim(`Source: ${session.source}`));
     console.log(c.dim(`Project: ${session.project}`));
     console.log(c.dim(`Size: ${formatSize(session.size)}  Messages: ${messages.length}\n`));
 
@@ -633,9 +988,10 @@ program
 program
   .command('projects')
   .description('List all projects with session data')
+  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (opts) => {
-    const projects = await getAllProjects();
+    const projects = await getAllProjects(opts.source);
 
     if (opts.json) {
       console.log(JSON.stringify(projects, null, 2));
@@ -650,9 +1006,12 @@ program
     console.log(c.bold(`${projects.length} projects\n`));
 
     for (const p of projects) {
+      const sources = p.sources
+        ? Object.entries(p.sources).map(([source, count]) => `${source}: ${count}`).join(', ')
+        : `${p.source}: ${p.sessionCount}`;
       console.log(
         c.cyan(p.path) + ' ' +
-        c.dim(`${p.sessionCount} session${p.sessionCount !== 1 ? 's' : ''}, ${formatSize(p.totalSize)}`)
+        c.dim(`${p.sessionCount} session${p.sessionCount !== 1 ? 's' : ''}, ${formatSize(p.totalSize)} (${sources})`)
       );
     }
   });
@@ -662,9 +1021,20 @@ program
   .description('Export a session transcript')
   .option('-f, --format <fmt>', 'Output format: md, json, text', 'md')
   .option('-o, --output <file>', 'Write to file instead of stdout')
+  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
   .action(async (sessionId, opts) => {
-    const sessions = await getSessionFiles();
-    const session = findSession(sessions, sessionId);
+    if (!['md', 'json', 'text'].includes(opts.format)) {
+      console.error(c.red(`Unsupported format: ${opts.format}. Use md, json, or text.`));
+      process.exit(1);
+    }
+    const sessions = await getSessionFiles(null, opts.source);
+    let session;
+    try {
+      session = resolveSession(sessions, sessionId);
+    } catch (error) {
+      console.error(c.red(error.message));
+      process.exit(1);
+    }
 
     if (!session) {
       console.error(c.red(`Session not found: ${sessionId}`));
@@ -672,7 +1042,7 @@ program
     }
 
     const messages = [];
-    await streamLines(session.filePath, (data) => {
+    await streamSessionMessages(session, (data) => {
       if (data.type === 'user' || data.type === 'assistant' || data.type === 'summary') {
         messages.push(data);
       }
@@ -696,12 +1066,13 @@ program
         const text = extractTextContent(msg.message?.content);
         if (!text || !text.trim()) continue;
         const ts = msg.timestamp ? new Date(msg.timestamp).toISOString() : '';
-        const who = msg.type === 'user' ? 'YOU' : 'CLAUDE';
+        const who = msg.type === 'user' ? 'YOU' : session.source.toUpperCase();
         const model = msg.message?.model ? ` (${msg.message.model})` : '';
         output += `[${who}${model}] ${ts}\n${text}\n\n`;
       }
     } else {
       output += `# Session: ${session.sessionId}\n\n`;
+      output += `**Source:** ${session.source}  \n`;
       output += `**Project:** ${session.project}  \n`;
       output += `**Messages:** ${contentMessages.length}  \n\n---\n\n`;
 
@@ -713,7 +1084,7 @@ program
         const text = extractTextContent(msg.message?.content);
         if (!text || !text.trim()) continue;
         const ts = msg.timestamp ? formatRelativeTime(msg.timestamp) : '';
-        const who = msg.type === 'user' ? '**You**' : '**Claude**';
+        const who = msg.type === 'user' ? '**You**' : `**${speakerName(session.source)}**`;
         const model = msg.message?.model ? ` *(${msg.message.model})*` : '';
         output += `### ${who}${model} \u2014 ${ts}\n\n${text}\n\n---\n\n`;
       }
@@ -732,24 +1103,16 @@ program
   .description('Show recent prompts from global history')
   .option('-n, --limit <n>', 'Max entries', '20')
   .option('-s, --search <query>', 'Filter by prompt text')
+  .option('-p, --project <path>', 'Filter by project path')
   .option('--days <n>', 'Entries from last N days')
+  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (opts) => {
-    if (!existsSync(HISTORY_FILE)) {
-      console.log('No history file found.');
-      return;
-    }
-
-    const entries = [];
-    await streamLines(HISTORY_FILE, (data) => {
-      entries.push(data);
-    });
-
-    let filtered = entries.reverse();
+    let filtered = await getHistoryEntries(opts.source);
     if (opts.days) {
       const since = daysToSinceDate(parseInt(opts.days));
       filtered = filtered.filter(e => {
-        const ts = e.timestamp ? new Date(e.timestamp) : null;
+        const ts = timestampDate(e.timestamp || e.ts);
         return ts && ts >= since;
       });
     }
@@ -759,6 +1122,10 @@ program
         const text = e.display || e.prompt || e.message || '';
         return text.toLowerCase().includes(q);
       });
+    }
+    if (opts.project) {
+      const q = opts.project.toLowerCase();
+      filtered = filtered.filter(e => (e.projectPath || e.project || '').toLowerCase().includes(q));
     }
 
     const shown = filtered.slice(0, parseInt(opts.limit));
@@ -779,7 +1146,7 @@ program
       const time = e.timestamp ? formatRelativeTime(e.timestamp) : '';
       const prompt = truncate(e.display || e.prompt || e.message || '(empty)', 100);
       const proj = e.projectPath || e.project || '';
-      console.log(c.cyan(time) + ' ' + c.dim(proj));
+      console.log(c.cyan(time) + ' ' + sourceTag(e.source) + ' ' + c.dim(proj));
       console.log(`  ${prompt}\n`);
     }
   });
@@ -791,15 +1158,20 @@ program
   .option('-n, --limit <n>', 'Max sessions to include', '10')
   .option('--days <n>', 'Sessions from last N days', '14')
   .option('--prompts <n>', 'Max user prompts per session', '8')
+  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (opts) => {
     const days = parseInt(opts.days);
     const since = daysToSinceDate(days);
-    let sessions = await getSessionFiles(opts.project);
+    let sessions = await getSessionFiles(opts.project, opts.source);
     sessions = sessions.filter(s => s.modifiedAt >= since);
     const shown = sessions.slice(0, parseInt(opts.limit));
 
     if (shown.length === 0) {
+      if (opts.json) {
+        console.log('[]');
+        return;
+      }
       console.log(`No sessions in the last ${days} days.`);
       return;
     }
@@ -814,7 +1186,7 @@ program
       let assistantCount = 0;
       let model = null;
 
-      await streamLines(s.filePath, (data) => {
+      await streamSessionMessages(s, (data) => {
         if (data.type === 'user') {
           userCount++;
           const text = extractTextContent(data.message?.content);
@@ -834,6 +1206,7 @@ program
       recaps.push({
         sessionId: s.sessionId,
         shortId: s.shortId,
+        source: s.source,
         project: s.project,
         size: s.size,
         modifiedAt: s.modifiedAt,
@@ -867,6 +1240,7 @@ program
       for (const r of daySessions) {
         const msgCount = r.userCount + r.assistantCount;
         const header = c.yellow(r.shortId) + ' ' +
+          sourceTag(r.source) + ' ' +
           c.dim(r.project) + ' ' +
           c.dim(`${msgCount} msgs, ${formatSize(r.size)}`) +
           (r.model ? c.dim(` (${r.model})`) : '');
@@ -891,24 +1265,32 @@ program
   .description('Show a compact timeline of recent work across all projects')
   .option('--days <n>', 'Activity from last N days', '7')
   .option('-n, --limit <n>', 'Max sessions', '30')
+  .option('-p, --project <path>', 'Filter by project path')
+  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (opts) => {
     const days = parseInt(opts.days);
     const since = daysToSinceDate(days);
-    let sessions = await getSessionFiles();
+    let sessions = await getSessionFiles(opts.project, opts.source);
     sessions = sessions.filter(s => s.modifiedAt >= since);
     const shown = sessions.slice(0, parseInt(opts.limit));
 
     if (shown.length === 0) {
+      if (opts.json) {
+        console.log('[]');
+        return;
+      }
       console.log(`No activity in the last ${days} days.`);
       return;
     }
 
     const activity = [];
     for (const s of shown) {
-      const meta = await getSessionMetaFast(s.filePath);
+      const meta = await getSessionMetaFast(s);
       activity.push({
+        sessionId: s.sessionId,
         shortId: s.shortId,
+        source: s.source,
         project: s.project,
         modifiedAt: s.modifiedAt,
         size: s.size,
@@ -937,7 +1319,7 @@ program
       for (const s of projectSessions) {
         const time = formatRelativeTime(s.modifiedAt);
         const prompt = s.firstPrompt ? truncate(s.firstPrompt, 90) : c.dim('(empty)');
-        console.log(`  ${c.yellow(s.shortId)} ${c.dim(time)}  ${prompt}`);
+        console.log(`  ${c.yellow(s.shortId)} ${sourceTag(s.source)} ${c.dim(time)}  ${prompt}`);
       }
       console.log('');
     }
