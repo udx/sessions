@@ -126,6 +126,8 @@ const codexMain = writeJsonl(rolloutPath(CODEX_ID), [
   codexContext('/workspace/shared'),
   responseMessage('developer', 'developer secret needle', -8_900),
   responseMessage('user', '<environment_context>internal environment needle</environment_context>', -8_850),
+  responseMessage('user', '<turn_aborted>internal abort needle</turn_aborted>', -8_825),
+  eventMessage('user', '<turn_aborted>internal event abort needle</turn_aborted>', -8_810),
   responseMessage('user', 'Codex unique needle with literal [x].', -8_800),
   eventMessage('user', 'Codex unique needle with literal [x].', -8_799),
   eventMessage('assistant', 'Codex answer needle.', -8_700),
@@ -327,6 +329,7 @@ test('show resolves a Codex short prefix', () => {
 test('show removes internal, developer, reasoning, and tool outputs', () => {
   const text = JSON.stringify(json(['show', CODEX_ID, '--source', 'codex']));
   assert(!text.includes('environment needle'));
+  assert(!text.includes('abort needle'));
   assert(!text.includes('developer secret'));
   assert(!text.includes('tool output secret'));
   assert(!text.includes('encrypted_content'));
@@ -386,7 +389,7 @@ test('search finds response-only and event-only messages', () => {
 });
 
 test('search excludes internal, developer, reasoning, and tool output text', () => {
-  for (const query of ['environment needle', 'developer secret', 'tool output secret', 'ignore-me']) {
+  for (const query of ['environment needle', 'abort needle', 'developer secret', 'tool output secret', 'ignore-me']) {
     assert.equal(json(['search', query, '--source', 'codex']).length, 0, query);
   }
 });

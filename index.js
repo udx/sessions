@@ -389,7 +389,8 @@ function codexTextBlocks(content) {
 }
 
 function isInternalCodexUserText(text) {
-  return /^<environment_context>[\s\S]*<\/environment_context>$/.test(text.trim());
+  const match = text.trim().match(/^<([a-z_]+)>[\s\S]*<\/\1>$/);
+  return match ? ['environment_context', 'turn_aborted'].includes(match[1]) : false;
 }
 
 function parseToolInput(value) {
@@ -403,6 +404,7 @@ function normalizeCodexRecord(data, state) {
   if (data.type === 'event_msg') {
     const role = data.payload?.type === 'user_message' ? 'user' : data.payload?.type === 'agent_message' ? 'assistant' : null;
     const text = data.payload?.message;
+    if (role === 'user' && typeof text === 'string' && isInternalCodexUserText(text)) return [];
     if (role && typeof text === 'string' && text.trim()) {
       return [{
         type: role,
@@ -417,9 +419,9 @@ function normalizeCodexRecord(data, state) {
   if (data.type === 'response_item' && data.payload?.type === 'message') {
     const role = data.payload.role;
     if (role !== 'user' && role !== 'assistant') return [];
-    const content = codexTextBlocks(data.payload.content);
+    let content = codexTextBlocks(data.payload.content);
+    if (role === 'user') content = content.filter(block => !isInternalCodexUserText(block.text));
     if (content.length === 0) return [];
-    if (role === 'user' && content.every(block => isInternalCodexUserText(block.text))) return [];
     return [{
       type: role,
       source: 'codex',
