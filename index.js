@@ -470,8 +470,9 @@ function normalizeKimiContextRecord(data) {
     const content = [];
     if (Array.isArray(data.content)) {
       for (const block of data.content) {
+        // Think blocks are dropped entirely so no output format (including
+        // --json) can expose chain-of-thought.
         if (block && block.type === 'text' && block.text) content.push({ type: 'text', text: block.text });
-        else if (block && block.type === 'think' && block.think) content.push({ type: 'thinking', thinking: block.think });
       }
     }
     for (const call of data.tool_calls || []) {
@@ -559,9 +560,9 @@ async function streamKimiWireMessages(session, callback) {
     }
     if (event.type === 'content.part') {
       const part = event.part || {};
+      if (part.type !== 'text' || !part.text) return; // think parts are dropped entirely
       if (!state.step) state.step = { timestamp: kimiTimestamp(data.time), content: [] };
-      if (part.type === 'text' && part.text) state.step.content.push({ type: 'text', text: part.text });
-      else if (part.type === 'think' && part.think) state.step.content.push({ type: 'thinking', thinking: part.think });
+      state.step.content.push({ type: 'text', text: part.text });
       return;
     }
     if (event.type === 'tool.call') {

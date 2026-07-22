@@ -676,6 +676,8 @@ test('modern Kimi search finds text but not injections, thinking, or tool intern
   for (const query of ['injected internal needle', 'kimi thinking secret', 'kimi tool output secret', 'kimi tool secret']) {
     assert.equal(json(['search', query, '--source', 'kimi']).length, 0, query);
   }
+  const shown = JSON.stringify(json(['show', KIMI_ID, '--source', 'kimi']));
+  assert(!shown.includes('kimi thinking secret needle'), 'thinking stays out of --json output');
 });
 
 test('modern Kimi messages carry timestamps from the wire log', () => {
@@ -700,6 +702,8 @@ test('legacy Kimi session parses context records and skips internal roles', () =
   assert.equal(json(['search', 'legacy thinking secret', '--source', 'kimi']).length, 0);
   assert.equal(json(['search', 'legacy tool secret', '--source', 'kimi']).length, 0);
   assert.equal(json(['search', 'Kimi legacy answer', '--source', 'kimi']).length, 1);
+  const shown = JSON.stringify(json(['show', KIMI_LEGACY_ID, '--source', 'kimi']));
+  assert(!shown.includes('legacy thinking secret needle'), 'thinking stays out of --json output');
 });
 
 test('legacy Kimi project falls back to the system prompt when unmapped', () => {
