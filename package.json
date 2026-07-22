@@ -1,7 +1,7 @@
 {
   "name": "@udx/sessions",
-  "version": "1.5.1",
-  "description": "Search, browse, and export Claude Code and Codex session transcripts from the command line.",
+  "version": "1.6.0",
+  "description": "Search, browse, and export Claude Code, Codex, and Kimi session transcripts from the command line.",
   "main": "index.js",
   "type": "module",
   "bin": {
@@ -14,6 +14,8 @@
     "claude",
     "claude-code",
     "codex",
+    "kimi",
+    "kimi-code",
     "sessions",
     "transcripts",
     "search",

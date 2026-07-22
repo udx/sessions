@@ -1,13 +1,14 @@
 # Sessions
 
-Search, browse, and export Claude Code and Codex session transcripts from the command line.
+Search, browse, and export Claude Code, Codex, and Kimi session transcripts from the command line.
 
-Sessions reads the local JSONL transcripts stored by Claude Code and Codex and provides full-text search, filtering, recap, and export across both tools. Commands search both sources by default; use `--source claude` or `--source codex` to narrow them.
+Sessions reads the local transcripts stored by Claude Code, Codex, and Kimi Code and provides full-text search, filtering, recap, and export across all three tools. Commands search all sources by default; use `--source claude`, `--source codex`, or `--source kimi` to narrow them.
 
 | Source | Sessions | Prompt history |
 |--------|----------|----------------|
 | Claude Code | `~/.claude/projects/` | `~/.claude/history.jsonl` |
 | Codex | `~/.codex/sessions/` and `~/.codex/archived_sessions/` | `~/.codex/history.jsonl` |
+| Kimi Code | `~/.kimi-code/sessions/` and `~/.kimi/sessions/` (legacy) | `~/.kimi-code/user-history/` and `~/.kimi/user-history/` |
 
 ## Installation
 
@@ -35,7 +36,7 @@ sessions search "refactor" -p my-project --source codex
 sessions search "deploy" --since 2026-05-01
 ```
 
-The `-C` flag shows surrounding conversation messages for context (not text lines within a message). Each context message is labeled `[you]`, `[claude]`, or `[codex]` so you can follow the conversation flow.
+The `-C` flag shows surrounding conversation messages for context (not text lines within a message). Each context message is labeled `[you]`, `[claude]`, `[codex]`, or `[kimi]` so you can follow the conversation flow.
 
 ### Show a session
 
@@ -50,7 +51,7 @@ sessions show a1b2c3d4 --no-tools -n 20
 
 The `--preview` flag shows a compact list of the first few prompts, useful for quickly understanding what a session was about. Combine with `--assistant-only` to preview assistant responses instead.
 
-Claude short IDs use the first 8 UUID characters. Codex short IDs use the first 12 because its time-ordered UUIDs commonly share their first 8. If an ID exists in both sources, qualify it as `claude:<id>` or `codex:<id>`.
+Claude and Kimi short IDs use the first 8 UUID characters. Codex short IDs use the first 12 because its time-ordered UUIDs commonly share their first 8. If an ID exists in multiple sources, qualify it as `claude:<id>`, `codex:<id>`, or `kimi:<id>`.
 
 ### List projects
 
@@ -99,7 +100,7 @@ Browsing commands support `--json` for machine-readable output; `export` uses `-
 
 | Option | Commands | Description |
 |--------|----------|-------------|
-| `--source <source>` | all | Search `all`, `claude`, or `codex` sessions (default `all`) |
+| `--source <source>` | all | Search `all`, `claude`, `codex`, or `kimi` sessions (default `all`) |
 | `-p, --project <path>` | list, search, history, recap, activity | Filter by project path (substring match) |
 | `-n, --limit <n>` | list, search, show, history | Max results to display |
 | `--since <date>` | list, search | Only sessions modified after this date |
@@ -128,11 +129,20 @@ Search results include `contextMessages` with `type`, `text`, and `position` fie
 
 ## Configuration
 
-Sessions respects `CLAUDE_CONFIG_DIR` and `CODEX_HOME`. Tests and custom integrations can override the roots directly with `SESSIONS_CLAUDE_DIR` and `SESSIONS_CODEX_DIR`.
+Sessions respects `CLAUDE_CONFIG_DIR` and `CODEX_HOME`. Tests and custom integrations can override the roots directly with `SESSIONS_CLAUDE_DIR`, `SESSIONS_CODEX_DIR`, and `SESSIONS_KIMI_DIR` (the Kimi override takes a single root; by default both `~/.kimi-code` and the legacy `~/.kimi` are scanned).
 
 Codex appends active sessions under date-based directories. Sessions scans those recursively, reads plain JSONL archives, filters internal/developer messages, and collapses Codex's adjacent event/response duplicates. Compressed `.jsonl.zst` archives are not currently read.
 
+Kimi Code sessions come in two on-disk generations, and both are read. Modern sessions live under `~/.kimi-code/sessions/wd_<slug>_<hash>/session_<uuid>/`; the project path and title come from `state.json` and the transcript is reconstructed from the main agent's event-sourced `agents/main/wire.jsonl` (user inputs from `context.append_message` events with `origin.kind: user`, assistant output grouped per step, model from `llm.request`). Legacy sessions under `~/.kimi/sessions/<md5(workdir)>/<uuid>/` are read from the ready-made `context.jsonl`, with the project path resolved through `kimi.json`'s `work_dirs` or, failing that, the session's system prompt. Kimi's `user-history` files carry no timestamps, so those history entries sort after timestamped ones; thinking blocks, tool results, and injected system reminders are never shown or searched.
+
 ## Changelog
+
+### 1.6.0
+- Added Kimi Code session discovery, search, show, export, recap, activity, projects, and history support
+- Reads both Kimi generations: modern `~/.kimi-code` wire-protocol sessions and legacy `~/.kimi` context sessions
+- Reconstructs modern wire logs into per-step assistant messages, skipping injected reminders, thinking, and tool results
+- Resolves Kimi project paths from `state.json`, `kimi.json` work_dirs, or the session system prompt
+- Extended `--source` and qualified IDs (`kimi:<id>`) to all commands; added 15 hermetic Kimi tests
 
 ### 1.5.0
 - Added Codex session discovery, search, show, export, recap, activity, projects, and history support
@@ -169,7 +179,7 @@ Codex appends active sessions under date-based directories. Sessions scans those
 
 ## How it works
 
-Claude Code stores each session under `~/.claude/projects/<encoded-project>/`. Codex stores active rollouts under `~/.codex/sessions/YYYY/MM/DD/` and plain archived rollouts under `~/.codex/archived_sessions/`. Sessions normalizes both formats while streaming files line by line. Project paths are resolved from Claude's session metadata or Codex's canonical `session_meta` record.
+Claude Code stores each session under `~/.claude/projects/<encoded-project>/`. Codex stores active rollouts under `~/.codex/sessions/YYYY/MM/DD/` and plain archived rollouts under `~/.codex/archived_sessions/`. Kimi Code stores sessions per working directory under `~/.kimi-code/sessions/` (and legacy `~/.kimi/sessions/`). Sessions normalizes all three formats while streaming files line by line. Project paths are resolved from Claude's session metadata, Codex's canonical `session_meta` record, or Kimi's `state.json` / `kimi.json` metadata.
 
 ## License
 

@@ -6,6 +6,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { createReadStream, existsSync } from 'fs';
 import { createInterface } from 'readline';
+import { createHash } from 'crypto';
 import os from 'os';
 import { fileURLToPath } from 'url';
 
@@ -18,23 +19,30 @@ const CLAUDE_HISTORY_FILE = path.join(CLAUDE_DIR, 'history.jsonl');
 const CODEX_SESSIONS_DIR = path.join(CODEX_DIR, 'sessions');
 const CODEX_ARCHIVED_SESSIONS_DIR = path.join(CODEX_DIR, 'archived_sessions');
 const CODEX_HISTORY_FILE = path.join(CODEX_DIR, 'history.jsonl');
-const VALID_SOURCES = new Set(['all', 'claude', 'codex']);
+const KIMI_ROOTS = process.env.SESSIONS_KIMI_DIR
+  ? [process.env.SESSIONS_KIMI_DIR]
+  : [path.join(os.homedir(), '.kimi-code'), path.join(os.homedir(), '.kimi')];
+const VALID_SOURCES = new Set(['all', 'claude', 'codex', 'kimi']);
 const c = chalk;
 
 function parseSource(value) {
   const source = String(value || 'all').toLowerCase();
   if (!VALID_SOURCES.has(source)) {
-    throw new InvalidArgumentError('source must be one of: all, claude, codex');
+    throw new InvalidArgumentError('source must be one of: all, claude, codex, kimi');
   }
   return source;
 }
 
 function sourceTag(source) {
-  return source === 'codex' ? c.magenta('[codex]') : c.blue('[claude]');
+  if (source === 'codex') return c.magenta('[codex]');
+  if (source === 'kimi') return c.whiteBright('[kimi]');
+  return c.blue('[claude]');
 }
 
 function speakerName(source) {
-  return source === 'codex' ? 'Codex' : 'Claude';
+  if (source === 'codex') return 'Codex';
+  if (source === 'kimi') return 'Kimi';
+  return 'Claude';
 }
 
 function sessionKey(session) {
@@ -330,35 +338,293 @@ async function getCodexSessionFiles(projectFilter = null) {
   return [...byId.values()].sort((a, b) => b.modifiedAt - a.modifiedAt);
 }
 
+// --- Kimi ---
+// Kimi Code has two on-disk generations, both rooted at <root>/sessions/:
+// - modern (~/.kimi-code): wd_<slug>_<hash>/session_<uuid>/ with metadata in
+//   state.json (workDir, title) and the main agent's transcript in
+//   agents/main/wire.jsonl (event-sourced wire protocol).
+// - legacy (~/.kimi): <md5(workdir)>/<uuid>/ with the ready-made conversation
+//   in context.jsonl. The project path comes from kimi.json's work_dirs
+//   (bucket name is its md5) or, failing that, the session's system prompt.
+
+function md5hex(value) {
+  return createHash('md5').update(value).digest('hex');
+}
+
+async function getKimiLegacyWorkDirMap(root) {
+  const map = new Map();
+  try {
+    const config = JSON.parse(await fs.readFile(path.join(root, 'kimi.json'), 'utf8'));
+    for (const dir of config.work_dirs || []) {
+      if (dir && dir.path) map.set(md5hex(dir.path), dir.path);
+    }
+  } catch {}
+  return map;
+}
+
+async function resolveKimiLegacyProject(bucketDir, bucket, workDirMap) {
+  if (workDirMap.has(bucket)) return workDirMap.get(bucket);
+  const entries = await fs.readdir(bucketDir).catch(() => []);
+  for (const entry of entries) {
+    const contextPath = path.join(bucketDir, entry, 'context.jsonl');
+    if (!existsSync(contextPath)) continue;
+    let cwd = null;
+    await streamLines(contextPath, (data) => {
+      if (data.role === '_system_prompt' && typeof data.content === 'string') {
+        const match = data.content.match(/working directory is `([^`]+)`/);
+        if (match) { cwd = match[1]; return true; }
+      }
+    });
+    if (cwd) return cwd;
+  }
+  return bucket;
+}
+
+async function getKimiSessionDescriptors() {
+  const descriptors = [];
+  for (const root of KIMI_ROOTS) {
+    const sessionsRoot = path.join(root, 'sessions');
+    if (!existsSync(sessionsRoot)) continue;
+    const legacyWorkDirs = await getKimiLegacyWorkDirMap(root);
+    const buckets = await fs.readdir(sessionsRoot).catch(() => []);
+
+    for (const bucket of buckets) {
+      const bucketDir = path.join(sessionsRoot, bucket);
+      const bucketStat = await fs.stat(bucketDir).catch(() => null);
+      if (!bucketStat || !bucketStat.isDirectory()) continue;
+      const isModern = bucket.startsWith('wd_');
+      let legacyProject = null;
+      const entries = await fs.readdir(bucketDir).catch(() => []);
+
+      for (const entry of entries) {
+        const sessionDir = path.join(bucketDir, entry);
+        const sessionStat = await fs.stat(sessionDir).catch(() => null);
+        if (!sessionStat || !sessionStat.isDirectory()) continue;
+
+        let sessionId;
+        let transcriptPath;
+        let format;
+        let project;
+        if (isModern && entry.startsWith('session_')) {
+          sessionId = entry.slice('session_'.length);
+          transcriptPath = path.join(sessionDir, 'agents', 'main', 'wire.jsonl');
+          format = 'wire';
+          project = null;
+          try {
+            const state = JSON.parse(await fs.readFile(path.join(sessionDir, 'state.json'), 'utf8'));
+            project = state.workDir || null;
+          } catch {}
+          project ||= bucket;
+        } else if (!isModern) {
+          sessionId = entry;
+          transcriptPath = path.join(sessionDir, 'context.jsonl');
+          format = 'context';
+          legacyProject ||= await resolveKimiLegacyProject(bucketDir, bucket, legacyWorkDirs);
+          project = legacyProject;
+        } else {
+          continue;
+        }
+
+        const stat = await fs.stat(transcriptPath).catch(() => null);
+        if (!stat || !stat.isFile()) continue;
+
+        descriptors.push({
+          sessionId,
+          shortId: makeShortId('kimi', sessionId),
+          source: 'kimi',
+          project,
+          projectEncoded: bucket,
+          filePath: transcriptPath,
+          format,
+          size: stat.size,
+          modifiedAt: stat.mtime
+        });
+      }
+    }
+  }
+  return descriptors;
+}
+
+async function getKimiSessionFiles(projectFilter = null) {
+  const filter = projectFilter ? projectFilter.toLowerCase() : null;
+  const descriptors = await getKimiSessionDescriptors();
+  return descriptors
+    .filter(session => !filter ||
+      session.project.toLowerCase().includes(filter) ||
+      session.projectEncoded.toLowerCase().includes(filter))
+    .sort((a, b) => b.modifiedAt - a.modifiedAt);
+}
+
+function normalizeKimiContextRecord(data) {
+  if (data.role === 'user') {
+    const text = extractTextContent(data.content);
+    if (!text || !text.trim()) return [];
+    return [{
+      type: 'user',
+      source: 'kimi',
+      message: { role: 'user', content: [{ type: 'text', text }] }
+    }];
+  }
+
+  if (data.role === 'assistant') {
+    const content = [];
+    if (Array.isArray(data.content)) {
+      for (const block of data.content) {
+        if (block && block.type === 'text' && block.text) content.push({ type: 'text', text: block.text });
+        else if (block && block.type === 'think' && block.think) content.push({ type: 'thinking', thinking: block.think });
+      }
+    }
+    for (const call of data.tool_calls || []) {
+      content.push({
+        type: 'tool_use',
+        name: call.function?.name || call.type || 'tool',
+        input: parseToolInput(call.function?.arguments)
+      });
+    }
+    if (content.length === 0) return [];
+    return [{
+      type: 'assistant',
+      source: 'kimi',
+      message: { role: 'assistant', content }
+    }];
+  }
+
+  return [];
+}
+
+function kimiTimestamp(value) {
+  return timestampDate(value)?.toISOString() || undefined;
+}
+
+// Reconstructs messages from the modern wire protocol: user input arrives as
+// context.append_message events (origin.kind 'user'; 'injection' events are
+// internal reminders), assistant output streams as per-step loop events which
+// are grouped into one assistant message per step.
+async function streamKimiWireMessages(session, callback) {
+  const state = { model: null, step: null };
+  let stopped = false;
+
+  const emit = (message) => {
+    if (callback(message) === true) {
+      stopped = true;
+      return true;
+    }
+    return false;
+  };
+
+  const flushStep = () => {
+    const step = state.step;
+    state.step = null;
+    if (!step || step.content.length === 0) return false;
+    return emit({
+      type: 'assistant',
+      source: 'kimi',
+      timestamp: step.timestamp,
+      message: { role: 'assistant', model: state.model || undefined, content: step.content }
+    });
+  };
+
+  await streamLines(session.filePath, (data) => {
+    if (data.type === 'llm.request') {
+      if (data.model) state.model = data.model;
+      return;
+    }
+
+    if (data.type === 'context.append_message') {
+      if (flushStep()) return true;
+      const msg = data.message || {};
+      const kind = msg.origin?.kind;
+      if (msg.role !== 'user' || (msg.origin && kind !== 'user')) return;
+      const text = extractTextContent(msg.content);
+      if (!text || !text.trim()) return;
+      return emit({
+        type: 'user',
+        source: 'kimi',
+        timestamp: kimiTimestamp(data.time),
+        message: { role: 'user', content: [{ type: 'text', text }] }
+      });
+    }
+
+    if (data.type !== 'context.append_loop_event') return;
+    const event = data.event || {};
+
+    if (event.type === 'step.begin') {
+      if (flushStep()) return true;
+      state.step = { timestamp: kimiTimestamp(data.time), content: [] };
+      return;
+    }
+    if (event.type === 'step.end') {
+      if (flushStep()) return true;
+      return;
+    }
+    if (event.type === 'content.part') {
+      const part = event.part || {};
+      if (!state.step) state.step = { timestamp: kimiTimestamp(data.time), content: [] };
+      if (part.type === 'text' && part.text) state.step.content.push({ type: 'text', text: part.text });
+      else if (part.type === 'think' && part.think) state.step.content.push({ type: 'thinking', thinking: part.think });
+      return;
+    }
+    if (event.type === 'tool.call') {
+      if (!state.step) state.step = { timestamp: kimiTimestamp(data.time), content: [] };
+      state.step.content.push({ type: 'tool_use', name: event.name || 'tool', input: parseToolInput(event.args) });
+    }
+  });
+
+  if (!stopped) flushStep();
+}
+
+async function getKimiHistoryWorkDirMap() {
+  const map = new Map();
+  for (const root of KIMI_ROOTS) {
+    for (const [hash, dir] of await getKimiLegacyWorkDirMap(root)) map.set(hash, dir);
+  }
+  for (const session of await getKimiSessionDescriptors()) {
+    if (session.format === 'wire' && session.project) map.set(md5hex(session.project), session.project);
+  }
+  return map;
+}
+
+
 async function getSessionFiles(projectFilter = null, source = 'all') {
   const selected = parseSource(source);
+  const include = (name) => selected === 'all' || selected === name;
   const groups = await Promise.all([
-    selected !== 'codex' ? getClaudeSessionFiles(projectFilter) : [],
-    selected !== 'claude' ? getCodexSessionFiles(projectFilter) : []
+    include('claude') ? getClaudeSessionFiles(projectFilter) : [],
+    include('codex') ? getCodexSessionFiles(projectFilter) : [],
+    include('kimi') ? getKimiSessionFiles(projectFilter) : []
   ]);
   return groups.flat().sort((a, b) => b.modifiedAt - a.modifiedAt);
 }
 
-async function getAllProjects(source = 'all') {
-  const selected = parseSource(source);
-  const claudeProjects = selected !== 'codex' ? await getClaudeProjects() : [];
-  const codexSessions = selected !== 'claude' ? await getCodexSessionFiles() : [];
-  const codexByProject = new Map();
-
-  for (const session of codexSessions) {
-    const current = codexByProject.get(session.project) || {
+function aggregateSessionsByProject(sessions, source) {
+  const byProject = new Map();
+  for (const session of sessions) {
+    const current = byProject.get(session.project) || {
       encoded: session.project,
       path: session.project,
-      source: 'codex',
+      source,
       sessionCount: 0,
       totalSize: 0
     };
     current.sessionCount++;
     current.totalSize += session.size;
-    codexByProject.set(session.project, current);
+    byProject.set(session.project, current);
   }
+  return [...byProject.values()];
+}
 
-  const combined = [...claudeProjects, ...codexByProject.values()];
+async function getAllProjects(source = 'all') {
+  const selected = parseSource(source);
+  const include = (name) => selected === 'all' || selected === name;
+  const claudeProjects = include('claude') ? await getClaudeProjects() : [];
+  const codexSessions = include('codex') ? await getCodexSessionFiles() : [];
+  const kimiSessions = include('kimi') ? await getKimiSessionFiles() : [];
+
+  const combined = [
+    ...claudeProjects,
+    ...aggregateSessionsByProject(codexSessions, 'codex'),
+    ...aggregateSessionsByProject(kimiSessions, 'kimi')
+  ];
   if (selected !== 'all') return combined.sort((a, b) => a.path.localeCompare(b.path));
 
   const merged = new Map();
@@ -458,6 +724,19 @@ async function streamSessionMessages(session, callback) {
     return;
   }
 
+  if (session.source === 'kimi') {
+    if (session.format === 'wire') {
+      await streamKimiWireMessages(session, callback);
+      return;
+    }
+    await streamLines(session.filePath, (data) => {
+      for (const message of normalizeKimiContextRecord(data)) {
+        if (callback(message) === true) return true;
+      }
+    });
+    return;
+  }
+
   const state = { model: null };
   let pending = null;
   let stopped = false;
@@ -547,15 +826,16 @@ function timestampDate(value) {
 
 async function getHistoryEntries(source = 'all') {
   const selected = parseSource(source);
+  const include = (name) => selected === 'all' || selected === name;
   const entries = [];
 
-  if (selected !== 'codex' && existsSync(CLAUDE_HISTORY_FILE)) {
+  if (include('claude') && existsSync(CLAUDE_HISTORY_FILE)) {
     await streamLines(CLAUDE_HISTORY_FILE, (data) => {
       entries.push({ ...data, source: 'claude' });
     });
   }
 
-  if (selected !== 'claude' && existsSync(CODEX_HISTORY_FILE)) {
+  if (include('codex') && existsSync(CODEX_HISTORY_FILE)) {
     const codexSessions = await getCodexSessionFiles();
     const sessionsById = new Map(codexSessions.map(session => [session.sessionId, session]));
     await streamLines(CODEX_HISTORY_FILE, (data) => {
@@ -572,6 +852,35 @@ async function getHistoryEntries(source = 'all') {
     });
   }
 
+  if (include('kimi')) {
+    const workDirMap = await getKimiHistoryWorkDirMap();
+    const seen = new Set();
+    for (const root of KIMI_ROOTS) {
+      const historyDir = path.join(root, 'user-history');
+      if (!existsSync(historyDir)) continue;
+      const files = await fs.readdir(historyDir).catch(() => []);
+      for (const file of files) {
+        if (!file.endsWith('.jsonl')) continue;
+        const projectPath = workDirMap.get(file.replace(/\.jsonl$/, '')) || '';
+        await streamLines(path.join(historyDir, file), (data) => {
+          if (typeof data.content !== 'string' || !data.content.trim()) return;
+          // The CLI's home migration copied user-history files verbatim, so
+          // the same file can exist under both roots.
+          const dedupeKey = `${file}:${data.content}`;
+          if (seen.has(dedupeKey)) return;
+          seen.add(dedupeKey);
+          entries.push({
+            source: 'kimi',
+            sessionId: null,
+            timestamp: timestampDate(data.timestamp)?.toISOString() || null,
+            projectPath,
+            display: data.content
+          });
+        });
+      }
+    }
+  }
+
   return entries.sort((a, b) => {
     const aTime = timestampDate(a.timestamp || a.ts)?.getTime() || 0;
     const bTime = timestampDate(b.timestamp || b.ts)?.getTime() || 0;
@@ -582,7 +891,7 @@ async function getHistoryEntries(source = 'all') {
 function findSessions(sessions, rawIdFragment) {
   let idFragment = rawIdFragment;
   let source = null;
-  const qualified = rawIdFragment.match(/^(claude|codex):(.+)$/i);
+  const qualified = rawIdFragment.match(/^(claude|codex|kimi):(.+)$/i);
   if (qualified) {
     source = qualified[1].toLowerCase();
     idFragment = qualified[2];
@@ -645,7 +954,7 @@ function formatMessageBlock(msg, opts = {}) {
 
 program
   .name('sessions')
-  .description('Search and browse Claude Code and Codex session transcripts')
+  .description('Search and browse Claude Code, Codex, and Kimi session transcripts')
   .version(pkg.version);
 
 program
@@ -657,7 +966,7 @@ program
   .option('--days <n>', 'Sessions from last N days')
   .option('--full', 'Show full message counts (slower)')
   .option('--preview', 'Show first few prompts per session')
-  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
+  .option('--source <source>', 'Session source: all, claude, codex, or kimi', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (opts) => {
     let sessions = await getSessionFiles(opts.project, opts.source);
@@ -735,7 +1044,7 @@ program
   .option('--since <date>', 'Only search sessions modified since date (YYYY-MM-DD)')
   .option('--days <n>', 'Only search sessions from last N days')
   .option('--preview', 'Show first few prompts per matched session')
-  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
+  .option('--source <source>', 'Session source: all, claude, codex, or kimi', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (query, opts) => {
     let sessions = await getSessionFiles(opts.project, opts.source);
@@ -912,7 +1221,7 @@ program
   .option('--preview', 'Show first few user prompts only (quick overview)')
   .option('-n, --limit <n>', 'Max messages to show')
   .option('--offset <n>', 'Skip first N messages', '0')
-  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
+  .option('--source <source>', 'Session source: all, claude, codex, or kimi', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (sessionId, opts) => {
     if (opts.userOnly && opts.assistantOnly) {
@@ -990,7 +1299,7 @@ program
 program
   .command('projects')
   .description('List all projects with session data')
-  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
+  .option('--source <source>', 'Session source: all, claude, codex, or kimi', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (opts) => {
     const projects = await getAllProjects(opts.source);
@@ -1023,7 +1332,7 @@ program
   .description('Export a session transcript')
   .option('-f, --format <fmt>', 'Output format: md, json, text', 'md')
   .option('-o, --output <file>', 'Write to file instead of stdout')
-  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
+  .option('--source <source>', 'Session source: all, claude, codex, or kimi', parseSource, 'all')
   .action(async (sessionId, opts) => {
     if (!['md', 'json', 'text'].includes(opts.format)) {
       console.error(c.red(`Unsupported format: ${opts.format}. Use md, json, or text.`));
@@ -1107,7 +1416,7 @@ program
   .option('-s, --search <query>', 'Filter by prompt text')
   .option('-p, --project <path>', 'Filter by project path')
   .option('--days <n>', 'Entries from last N days')
-  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
+  .option('--source <source>', 'Session source: all, claude, codex, or kimi', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (opts) => {
     let filtered = await getHistoryEntries(opts.source);
@@ -1160,7 +1469,7 @@ program
   .option('-n, --limit <n>', 'Max sessions to include', '10')
   .option('--days <n>', 'Sessions from last N days', '14')
   .option('--prompts <n>', 'Max user prompts per session', '8')
-  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
+  .option('--source <source>', 'Session source: all, claude, codex, or kimi', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (opts) => {
     const days = parseInt(opts.days);
@@ -1268,7 +1577,7 @@ program
   .option('--days <n>', 'Activity from last N days', '7')
   .option('-n, --limit <n>', 'Max sessions', '30')
   .option('-p, --project <path>', 'Filter by project path')
-  .option('--source <source>', 'Session source: all, claude, or codex', parseSource, 'all')
+  .option('--source <source>', 'Session source: all, claude, codex, or kimi', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (opts) => {
     const days = parseInt(opts.days);

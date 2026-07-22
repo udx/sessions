@@ -2,6 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   mkdtempSync,
   mkdirSync,
@@ -19,8 +20,10 @@ const CLI = path.join(__dirname, 'index.js');
 const root = mkdtempSync(path.join(os.tmpdir(), 'sessions-dual-source-'));
 const claudeDir = path.join(root, 'claude');
 const codexDir = path.join(root, 'codex');
+const kimiDir = path.join(root, 'kimi');
 const now = Date.now();
 const iso = offset => new Date(now + offset).toISOString();
+const md5 = value => createHash('md5').update(value).digest('hex');
 
 const CLAUDE_ID = 'aaaaaaaa-1111-4222-8333-aaaaaaaaaaaa';
 const CLAUDE_ONLY_ID = 'bbbbbbbb-1111-4222-8333-bbbbbbbbbbbb';
@@ -28,6 +31,8 @@ const CODEX_ID = '019f0000-1111-7222-8333-abcdefabcdef';
 const CODEX_RESPONSE_ID = '019f0000-2222-7222-8333-bbbbbbbbbbbb';
 const CODEX_ARCHIVE_ID = '019f0000-3333-7222-8333-cccccccccccc';
 const PARENT_ID = '019f0000-9999-7222-8333-dddddddddddd';
+const KIMI_ID = 'dddddddd-1111-4222-8333-dddddddddddd';
+const KIMI_LEGACY_ID = 'eeeeeeee-1111-4222-8333-eeeeeeeeeeee';
 
 function ensureDir(filePath) {
   mkdirSync(path.dirname(filePath), { recursive: true });
@@ -200,12 +205,102 @@ writeJsonl(path.join(codexDir, 'history.jsonl'), [
   { session_id: CODEX_RESPONSE_ID, text: 'Legacy history needle', ts: Math.floor((now - 6_000) / 1000) }
 ]);
 
+// --- Kimi fixtures ---
+// Modern layout: sessions/wd_<slug>_<hash>/session_<uuid>/{state.json,agents/main/wire.jsonl}
+// Legacy layout: sessions/<md5(workdir)>/<uuid>/context.jsonl with project
+// resolution through kimi.json work_dirs, falling back to the system prompt.
+
+function kimiWireAppend(text, offset, kind = 'user') {
+  return {
+    type: 'context.append_message',
+    message: { role: 'user', content: [{ type: 'text', text }], toolCalls: [], origin: { kind } },
+    time: now + offset
+  };
+}
+
+function kimiLoop(event, offset) {
+  return { type: 'context.append_loop_event', event, time: now + offset };
+}
+
+const kimiModernDir = path.join(kimiDir, 'sessions', 'wd_shared_aabbccddeeff', `session_${KIMI_ID}`);
+ensureDir(path.join(kimiModernDir, 'state.json'));
+writeFileSync(
+  path.join(kimiModernDir, 'state.json'),
+  JSON.stringify({
+    createdAt: iso(-9_000),
+    updatedAt: iso(-1_000),
+    title: 'Kimi unique needle',
+    workDir: '/workspace/shared',
+    agents: { main: { homedir: path.join(kimiModernDir, 'agents', 'main'), type: 'main' } }
+  }) + '\n'
+);
+const kimiMain = writeJsonl(path.join(kimiModernDir, 'agents', 'main', 'wire.jsonl'), [
+  { type: 'metadata', protocol_version: '1.4', created_at: now - 9_000 },
+  { type: 'llm.request', kind: 'loop', provider: 'kimi', model: 'kimi-test', time: now - 8_900 },
+  kimiWireAppend('<system-reminder>injected internal needle</system-reminder>', -8_850, 'injection'),
+  kimiWireAppend('Kimi unique needle with literal [x].', -8_800),
+  kimiLoop({ type: 'step.begin', turnId: '0', step: 1 }, -8_700),
+  kimiLoop({ type: 'content.part', part: { type: 'think', think: 'kimi thinking secret needle' } }, -8_690),
+  kimiLoop({ type: 'content.part', part: { type: 'text', text: 'Kimi answer needle.' } }, -8_680),
+  kimiLoop({ type: 'tool.call', name: 'Shell', args: { command: 'kimi tool secret needle' } }, -8_670),
+  kimiLoop({ type: 'tool.result', result: { output: 'kimi tool output secret needle' } }, -8_660),
+  kimiLoop({ type: 'step.end', finishReason: 'tool_use' }, -8_650),
+  kimiWireAppend('Kimi second prompt.', -8_600),
+  kimiLoop({ type: 'step.begin', turnId: '1', step: 1 }, -8_500),
+  kimiLoop({ type: 'content.part', part: { type: 'text', text: 'Second kimi answer.' } }, -8_490),
+  kimiLoop({ type: 'step.end', finishReason: 'stop' }, -8_480)
+]);
+touch(kimiMain, -1_000);
+
+ensureDir(path.join(kimiDir, 'kimi.json'));
+writeFileSync(
+  path.join(kimiDir, 'kimi.json'),
+  JSON.stringify({ work_dirs: [{ path: '/workspace/kimi-legacy', kaos: 'local', last_session_id: null }] }) + '\n'
+);
+
+const kimiLegacy = writeJsonl(
+  path.join(kimiDir, 'sessions', md5('/workspace/kimi-legacy'), KIMI_LEGACY_ID, 'context.jsonl'),
+  [
+    { role: '_system_prompt', content: 'You are Kimi Code CLI. The current working directory is `/workspace/kimi-legacy`. system prompt secret needle' },
+    { role: '_checkpoint', id: 0 },
+    { role: 'user', content: 'Kimi legacy needle prompt.' },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'think', think: 'legacy thinking secret needle' },
+        { type: 'text', text: 'Kimi legacy answer.' }
+      ],
+      tool_calls: [{ type: 'function', id: 'tool_1', function: { name: 'Read', arguments: '{"file":"legacy tool secret needle"}' } }]
+    },
+    { role: 'tool', content: [{ type: 'text', text: 'legacy tool output secret needle' }], tool_call_id: 'tool_1' },
+    { role: '_usage', token_count: 10 },
+    { role: 'user', content: 'Legacy second prompt.' },
+    { role: 'assistant', content: [{ type: 'text', text: 'Legacy second answer.' }] }
+  ]
+);
+touch(kimiLegacy, -2_000);
+
+const kimiCollision = writeJsonl(
+  path.join(kimiDir, 'sessions', md5('/workspace/collision'), CLAUDE_ID, 'context.jsonl'),
+  [
+    { role: '_system_prompt', content: 'You are Kimi Code CLI. The current working directory is `/workspace/collision`.' },
+    { role: 'user', content: 'Kimi collision prompt.' }
+  ]
+);
+touch(kimiCollision, -4_000);
+
+writeJsonl(path.join(kimiDir, 'user-history', `${md5('/workspace/shared')}.jsonl`), [
+  { content: 'Kimi history needle' },
+  { content: '/model' }
+]);
+
 const baseEnv = {
   ...process.env,
   NO_COLOR: '1',
   TZ: 'UTC',
   SESSIONS_CLAUDE_DIR: claudeDir,
-  SESSIONS_CODEX_DIR: codexDir
+  SESSIONS_CODEX_DIR: codexDir,
+  SESSIONS_KIMI_DIR: kimiDir
 };
 
 function invoke(args, env = baseEnv) {
@@ -245,19 +340,20 @@ function test(name, fn) {
 
 console.log('\ndual-source fixtures');
 
-test('help advertises Claude and Codex', () => {
-  assert.match(run(['--help']), /Claude Code and Codex/);
+test('help advertises Claude, Codex, and Kimi', () => {
+  assert.match(run(['--help']), /Claude Code, Codex, and Kimi/);
   assert.match(run(['list', '--help']), /--source/);
 });
 
-test('default list includes both sources', () => {
+test('default list includes all sources', () => {
   const data = json(['list', '--limit', '20']);
-  assert.deepEqual(new Set(data.map(item => item.source)), new Set(['claude', 'codex']));
+  assert.deepEqual(new Set(data.map(item => item.source)), new Set(['claude', 'codex', 'kimi']));
 });
 
-test('source filters isolate Claude and Codex', () => {
+test('source filters isolate Claude, Codex, and Kimi', () => {
   assert(json(['list', '--source', 'claude', '--limit', '20']).every(item => item.source === 'claude'));
   assert(json(['list', '--source', 'codex', '--limit', '20']).every(item => item.source === 'codex'));
+  assert(json(['list', '--source', 'kimi', '--limit', '20']).every(item => item.source === 'kimi'));
 });
 
 test('list is globally sorted and respects limit', () => {
@@ -310,6 +406,7 @@ test('projects merges a shared path across sources', () => {
   assert.equal(project.source, 'all');
   assert.equal(project.sources.claude, 1);
   assert.equal(project.sources.codex, 1);
+  assert.equal(project.sources.kimi, 1);
 });
 
 test('projects source filter reports only that source', () => {
@@ -380,7 +477,7 @@ test('search finds a Codex paired message exactly once', () => {
 
 test('search supports literal regex punctuation', () => {
   const data = json(['search', '[x]', '--limit', '20']);
-  assert.deepEqual(new Set(data.map(item => item.source)), new Set(['claude', 'codex']));
+  assert.deepEqual(new Set(data.map(item => item.source)), new Set(['claude', 'codex', 'kimi']));
 });
 
 test('search finds response-only and event-only messages', () => {
@@ -446,8 +543,9 @@ test('history supports source, project, and text filtering', () => {
 
 test('mixed history is globally sorted', () => {
   const data = json(['history', '--limit', '10']);
-  assert.deepEqual(new Set(data.map(entry => entry.source)), new Set(['claude', 'codex']));
-  const times = data.map(entry => new Date(entry.timestamp).getTime());
+  assert.deepEqual(new Set(data.map(entry => entry.source)), new Set(['claude', 'codex', 'kimi']));
+  // Kimi user-history carries no timestamps; those entries sort last as 0.
+  const times = data.map(entry => (entry.timestamp ? new Date(entry.timestamp).getTime() : 0));
   assert.deepEqual(times, [...times].sort((a, b) => b - a));
 });
 
@@ -459,9 +557,9 @@ test('recap returns Codex prompts, counts, and source', () => {
   assert.equal(recap.prompts[0].text, 'Codex unique needle with literal [x].');
 });
 
-test('activity returns both sources and supports project filtering', () => {
+test('activity returns all sources and supports project filtering', () => {
   const data = json(['activity', '--project', '/workspace/shared', '--days', '30', '--limit', '10']);
-  assert.deepEqual(new Set(data.map(item => item.source)), new Set(['claude', 'codex']));
+  assert.deepEqual(new Set(data.map(item => item.source)), new Set(['claude', 'codex', 'kimi']));
   assert(data.every(item => item.project === '/workspace/shared'));
 });
 
@@ -470,6 +568,8 @@ test('qualified IDs resolve a cross-source full-ID collision', () => {
   assert(messages.every(message => message.source === 'claude'));
   const codexMessages = json(['show', `codex:${CLAUDE_ID}`]);
   assert(codexMessages.every(message => message.source === 'codex'));
+  const kimiMessages = json(['show', `kimi:${CLAUDE_ID}`]);
+  assert(kimiMessages.every(message => message.source === 'kimi'));
 });
 
 test('unqualified cross-source collision errors instead of guessing', () => {
@@ -488,7 +588,8 @@ test('all JSON commands return arrays against empty roots', () => {
   const emptyEnv = {
     ...baseEnv,
     SESSIONS_CLAUDE_DIR: path.join(emptyRoot, 'claude'),
-    SESSIONS_CODEX_DIR: path.join(emptyRoot, 'codex')
+    SESSIONS_CODEX_DIR: path.join(emptyRoot, 'codex'),
+    SESSIONS_KIMI_DIR: path.join(emptyRoot, 'kimi')
   };
   for (const args of [
     ['list'], ['projects'], ['search', 'needle'], ['history'], ['recap'], ['activity']
@@ -501,6 +602,135 @@ test('malformed trailing JSONL and ignored temp files do not break discovery', (
   const data = json(['list', '--source', 'codex', '--limit', '50']);
   assert(data.some(item => item.sessionId === CODEX_ID));
   assert(!data.some(item => item.filePath.endsWith('.tmp')));
+});
+
+console.log('\nkimi source');
+
+test('list discovers modern and legacy Kimi sessions with their projects', () => {
+  const data = json(['list', '--source', 'kimi', '--limit', '20']);
+  const modern = data.find(item => item.sessionId === KIMI_ID);
+  const legacy = data.find(item => item.sessionId === KIMI_LEGACY_ID);
+  assert(modern, 'modern session discovered');
+  assert(legacy, 'legacy session discovered');
+  assert.equal(modern.project, '/workspace/shared');
+  assert.equal(modern.format, 'wire');
+  assert.equal(legacy.project, '/workspace/kimi-legacy');
+  assert.equal(legacy.format, 'context');
+});
+
+test('modern Kimi list extracts model and real first prompt', () => {
+  const item = json(['list', '--source', 'kimi', '--project', '/workspace/shared', '--limit', '5'])
+    .find(session => session.sessionId === KIMI_ID);
+  assert.equal(item.model, 'kimi-test');
+  assert.equal(item.firstPrompt, 'Kimi unique needle with literal [x].');
+  assert(!item.firstPrompt.includes('system-reminder'));
+});
+
+test('Kimi full counts group streamed loop events into one message per step', () => {
+  const item = json(['list', '--source', 'kimi', '--project', '/workspace/shared', '--full', '--limit', '5'])
+    .find(session => session.sessionId === KIMI_ID);
+  assert.equal(item.userCount, 2);
+  assert.equal(item.assistantCount, 2);
+  assert.equal(item.messageCount, 4);
+});
+
+test('Kimi project filter matches modern bucket names', () => {
+  const data = json(['list', '--source', 'kimi', '--project', 'wd_shared', '--limit', '10']);
+  assert.equal(data.length, 1);
+  assert.equal(data[0].sessionId, KIMI_ID);
+});
+
+test('Kimi projects reports modern and legacy project paths', () => {
+  const data = json(['projects', '--source', 'kimi']);
+  assert(data.every(project => project.source === 'kimi'));
+  const paths = data.map(project => project.path);
+  assert(paths.includes('/workspace/shared'));
+  assert(paths.includes('/workspace/kimi-legacy'));
+});
+
+test('modern Kimi show skips injections and tool results but renders tool calls', () => {
+  const out = run(['show', KIMI_ID, '--source', 'kimi']);
+  assert.match(out, /Source: kimi/);
+  assert.match(out, /Kimi/);
+  assert.match(out, /Shell/);
+  assert(out.includes('Kimi answer needle.'));
+  assert(!out.includes('injected internal needle'));
+  assert(!out.includes('kimi tool output secret needle'));
+});
+
+test('modern Kimi show --no-tools hides tool calls but keeps text', () => {
+  const out = run(['show', KIMI_ID, '--source', 'kimi', '--no-tools']);
+  assert(!out.includes('Shell'));
+  assert(out.includes('Kimi answer needle.'));
+});
+
+test('modern Kimi show --assistant-only contains only text assistants', () => {
+  const messages = json(['show', KIMI_ID, '--source', 'kimi', '--assistant-only']);
+  assert(messages.length > 0);
+  assert(messages.every(message => message.type === 'assistant'));
+  assert(messages.every(message => message.message.content.some(block => block.type === 'text')));
+});
+
+test('modern Kimi search finds text but not injections, thinking, or tool internals', () => {
+  assert.equal(json(['search', 'Kimi answer needle', '--source', 'kimi']).length, 1);
+  for (const query of ['injected internal needle', 'kimi thinking secret', 'kimi tool output secret', 'kimi tool secret']) {
+    assert.equal(json(['search', query, '--source', 'kimi']).length, 0, query);
+  }
+});
+
+test('modern Kimi messages carry timestamps from the wire log', () => {
+  const [match] = json(['search', 'Kimi second prompt', '--source', 'kimi']);
+  assert(match.timestamp, 'has timestamp');
+  assert(!Number.isNaN(new Date(match.timestamp).getTime()), 'timestamp parses');
+});
+
+test('legacy Kimi session parses context records and skips internal roles', () => {
+  const item = json(['list', '--source', 'kimi', '--project', '/workspace/kimi-legacy', '--full', '--limit', '5'])
+    .find(session => session.sessionId === KIMI_LEGACY_ID);
+  assert.equal(item.firstPrompt, 'Kimi legacy needle prompt.');
+  assert.equal(item.userCount, 2);
+  assert.equal(item.assistantCount, 2);
+
+  const out = run(['show', KIMI_LEGACY_ID, '--source', 'kimi']);
+  assert(out.includes('Kimi legacy answer.'));
+  assert.match(out, /Read/);
+  assert(!out.includes('legacy tool output secret needle'));
+  assert(!out.includes('system prompt secret needle'));
+
+  assert.equal(json(['search', 'legacy thinking secret', '--source', 'kimi']).length, 0);
+  assert.equal(json(['search', 'legacy tool secret', '--source', 'kimi']).length, 0);
+  assert.equal(json(['search', 'Kimi legacy answer', '--source', 'kimi']).length, 1);
+});
+
+test('legacy Kimi project falls back to the system prompt when unmapped', () => {
+  const item = json(['list', '--source', 'kimi', '--limit', '20'])
+    .find(session => session.sessionId === CLAUDE_ID);
+  assert.equal(item.project, '/workspace/collision');
+});
+
+test('Kimi exports label their source', () => {
+  const md = run(['export', KIMI_ID, '--source', 'kimi', '--format', 'md']);
+  assert.match(md, /\*\*Source:\*\* kimi/);
+  assert.match(md, /\*\*Kimi\*\*/);
+  const text = run(['export', KIMI_ID, '--source', 'kimi', '--format', 'text']);
+  assert.match(text, /\[KIMI/);
+  assert(!text.includes('[CLAUDE'));
+});
+
+test('Kimi history resolves project paths from session workDirs', () => {
+  const data = json(['history', '--source', 'kimi', '--search', 'Kimi history needle']);
+  assert.equal(data.length, 1);
+  assert.equal(data[0].source, 'kimi');
+  assert.equal(data[0].projectPath, '/workspace/shared');
+  assert.equal(data[0].display, 'Kimi history needle');
+});
+
+test('recap returns Kimi prompts, counts, and source', () => {
+  const recap = json(['recap', '--source', 'kimi', '--project', '/workspace/shared', '--days', '30', '--limit', '5'])
+    .find(item => item.sessionId === KIMI_ID);
+  assert.equal(recap.source, 'kimi');
+  assert.equal(recap.userCount, 2);
+  assert.equal(recap.prompts[0].text, 'Kimi unique needle with literal [x].');
 });
 
 rmSync(root, { recursive: true, force: true });
