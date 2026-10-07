@@ -737,6 +737,85 @@ test('recap returns Kimi prompts, counts, and source', () => {
   assert.equal(recap.prompts[0].text, 'Kimi unique needle with literal [x].');
 });
 
+// Desktop response-item format, with no CLI global history for the chat.
+const desktopDir = path.join(root, 'desktop-codex');
+const desktopId = '01a11729-ee11-7092-ab2a-f216334a366a';
+const desktopEnv = { ...baseEnv, SESSIONS_CODEX_DIR: desktopDir };
+const desktopFile = path.join(desktopDir, 'sessions', '2026', '10', '07', `rollout-2026-10-07T12-19-46-${desktopId}.jsonl`);
+writeJsonl(desktopFile, [
+  codexMeta(desktopId, '/workspace/desktop'),
+  responseMessage('user', '<environment_context>internal desktop environment</environment_context>', -9_900),
+  responseMessage('user', '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>', -9_800),
+  responseMessage('user', '<recommended_plugins>internal desktop plugins</recommended_plugins>', -9_700),
+  codexContext('/workspace/desktop'),
+  responseMessage('user', 'Desktop prompt needle.', -8_000),
+  { type: 'event_msg', timestamp: iso(-8_000), payload: { type: 'item_completed', item: { type: 'userMessage', content: [{ type: 'text', text: 'Desktop prompt needle.' }] } } },
+  responseMessage('assistant', 'Desktop answer needle.', -7_000),
+  { type: 'response_item', timestamp: iso(-6_000), payload: { type: 'custom_tool_call', name: 'functions.exec', input: 'text(await tools.example({}));', call_id: 'desktop-call' } },
+  { type: 'response_item', timestamp: iso(-5_000), payload: { type: 'custom_tool_call_output', call_id: 'desktop-call', output: 'desktop tool output secret' } },
+  responseMessage('user', 'Desktop prompt needle.', -4_000),
+  responseMessage('user', '<send_user_message_question_reply>Keep this user reply</send_user_message_question_reply>', -3_000),
+  responseMessage('user', 'Discuss <recommended_plugins> in documentation.', -2_000)
+], true);
+
+test('desktop list uses the real prompt and show preserves custom tool calls', () => {
+  const [session] = json(['list', '--source', 'codex', '--full'], desktopEnv);
+  assert.equal(session.firstPrompt, 'Desktop prompt needle.');
+  assert.equal(session.model, 'gpt-test');
+  assert.equal(session.userCount, 4);
+  const shown = json(['show', desktopId, '--source', 'codex'], desktopEnv);
+  assert(shown.some(message => message.message.content.some(block => block.type === 'tool_use' && block.name === 'functions.exec')));
+  assert(!JSON.stringify(shown).includes('desktop tool output secret'));
+});
+
+test('desktop context stays out of search and all export formats', () => {
+  assert.equal(json(['search', 'external_codex_apps_open_page', '--source', 'codex'], desktopEnv).length, 0);
+  assert.equal(json(['search', 'internal desktop plugins', '--source', 'codex'], desktopEnv).length, 0);
+  assert.equal(json(['search', 'Desktop prompt needle', '--source', 'codex'], desktopEnv).length, 2);
+  for (const format of ['md', 'text', 'json']) {
+    const out = run(['export', desktopId, '--source', 'codex', '--format', format], desktopEnv);
+    assert(out.includes('Desktop answer needle.'));
+    assert(out.includes('Keep this user reply'));
+    assert(out.includes('Discuss <recommended_plugins>'));
+    assert(!out.includes('external_codex_apps_open_page'));
+    assert(!out.includes('internal desktop plugins'));
+  }
+});
+
+test('desktop history works without history.jsonl and retains repeated prompts', () => {
+  const entries = json(['history', '--source', 'codex', '--project', '/workspace/desktop'], desktopEnv);
+  assert.equal(entries.length, 4);
+  const repeats = entries.filter(entry => entry.display === 'Desktop prompt needle.');
+  assert.equal(repeats.length, 2);
+  assert.equal(repeats[0].timestamp, iso(-4_000));
+  assert.equal(repeats[1].timestamp, iso(-8_000));
+  assert(entries.every(entry => entry.sessionId === desktopId));
+  assert.equal(json(['history', '--source', 'codex', '--search', 'answer'], desktopEnv).length, 0);
+});
+
+test('desktop history supplements a CLI history file without duplicating CLI sessions', () => {
+  writeJsonl(path.join(desktopDir, 'history.jsonl'), [
+    { session_id: 'cli-only', text: 'CLI history prompt', ts: Math.floor(now / 1000) }
+  ]);
+  const entries = json(['history', '--source', 'codex'], desktopEnv);
+  assert.equal(entries.length, 5);
+  assert.equal(entries[0].display, 'CLI history prompt');
+  writeJsonl(path.join(desktopDir, 'history.jsonl'), [
+    { session_id: desktopId, text: 'Desktop prompt needle.', ts: Math.floor(now / 1000) }
+  ]);
+  const authoritative = json(['history', '--source', 'codex'], desktopEnv);
+  assert.equal(authoritative.length, 1);
+  assert.equal(authoritative[0].projectPath, '/workspace/desktop');
+});
+
+test('CODEX_HOME works and SESSIONS_CODEX_DIR takes precedence', () => {
+  const env = { ...desktopEnv, CODEX_HOME: desktopDir };
+  delete env.SESSIONS_CODEX_DIR;
+  assert.equal(json(['list', '--source', 'codex'], env)[0].sessionId, desktopId);
+  env.SESSIONS_CODEX_DIR = path.join(root, 'missing-codex');
+  assert.deepEqual(json(['list', '--source', 'codex'], env), []);
+});
+
 rmSync(root, { recursive: true, force: true });
 const color = failed ? 31 : 32;
 console.log(`\n\x1b[${color}m${passed} passed, ${failed} failed\x1b[0m\n`);

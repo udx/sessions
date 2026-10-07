@@ -131,11 +131,16 @@ Search results include `contextMessages` with `type`, `text`, and `position` fie
 
 Sessions respects `CLAUDE_CONFIG_DIR` and `CODEX_HOME`. Tests and custom integrations can override the roots directly with `SESSIONS_CLAUDE_DIR`, `SESSIONS_CODEX_DIR`, and `SESSIONS_KIMI_DIR` (the Kimi override takes a single root; by default both `~/.kimi-code` and the legacy `~/.kimi` are scanned).
 
-Codex appends active sessions under date-based directories. Sessions scans those recursively, reads plain JSONL archives, filters internal/developer messages, and collapses Codex's adjacent event/response duplicates. Compressed `.jsonl.zst` archives are not currently read.
+Codex CLI and desktop app sessions are both supported. Codex appends active sessions under date-based directories. Sessions scans those recursively, reads plain JSONL archives, filters internal/developer messages, and collapses Codex's adjacent event/response duplicates. Desktop Page context and plugin recommendations are excluded from prompts and search; actual user replies are retained. For sessions absent from `history.jsonl` (including desktop chats), `history` reads user prompts from the transcripts. Existing global history remains authoritative for sessions it contains. Compressed `.jsonl.zst` archives are not currently read.
 
 Kimi Code sessions come in two on-disk generations, and both are read. Modern sessions live under `~/.kimi-code/sessions/wd_<slug>_<hash>/session_<uuid>/`; the project path and title come from `state.json` and the transcript is reconstructed from the main agent's event-sourced `agents/main/wire.jsonl` (user inputs from `context.append_message` events with `origin.kind: user`, assistant output grouped per step, model from `llm.request`). Legacy sessions under `~/.kimi/sessions/<md5(workdir)>/<uuid>/` are read from the ready-made `context.jsonl`, with the project path resolved through `kimi.json`'s `work_dirs` or, failing that, the session's system prompt. Kimi's `user-history` files carry no timestamps, so those history entries sort after timestamped ones; thinking blocks, tool results, and injected system reminders are never shown or searched.
 
 ## Changelog
+
+### 1.6.1
+- Fixed Codex desktop Page context and plugin recommendations appearing as user prompts
+- Added transcript-based history for Codex sessions absent from CLI global history
+- Added desktop-format regression tests, including custom tools and environment overrides
 
 ### 1.6.0
 - Added Kimi Code session discovery, search, show, export, recap, activity, projects, and history support

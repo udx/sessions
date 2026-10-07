@@ -657,7 +657,10 @@ function codexTextBlocks(content) {
 
 function isInternalCodexUserText(text) {
   const match = text.trim().match(/^<([a-z_]+)>[\s\S]*<\/\1>$/);
-  return match ? ['environment_context', 'turn_aborted'].includes(match[1]) : false;
+  return match ? [
+    'environment_context', 'turn_aborted',
+    'external_codex_apps_open_page', 'recommended_plugins'
+  ].includes(match[1]) : false;
 }
 
 function parseToolInput(value) {
@@ -836,11 +839,13 @@ async function getHistoryEntries(source = 'all') {
     });
   }
 
-  if (include('codex') && existsSync(CODEX_HISTORY_FILE)) {
+  if (include('codex')) {
     const codexSessions = await getCodexSessionFiles();
     const sessionsById = new Map(codexSessions.map(session => [session.sessionId, session]));
-    await streamLines(CODEX_HISTORY_FILE, (data) => {
-      if (typeof data.text !== 'string') return;
+    const historySessionIds = new Set();
+    if (existsSync(CODEX_HISTORY_FILE)) await streamLines(CODEX_HISTORY_FILE, (data) => {
+      if (typeof data.text !== 'string' || !data.text.trim() || isInternalCodexUserText(data.text)) return;
+      historySessionIds.add(data.session_id);
       const session = sessionsById.get(data.session_id);
       const timestamp = timestampDate(data.ts)?.toISOString() || null;
       entries.push({
@@ -851,6 +856,24 @@ async function getHistoryEntries(source = 'all') {
         display: data.text
       });
     });
+    // Desktop chats may never appear in the CLI's global history. Use their
+    // normalized transcript prompts, preserving repeats and source timestamps.
+    // Global history remains authoritative for sessions it already contains.
+    for (const session of codexSessions) {
+      if (historySessionIds.has(session.sessionId)) continue;
+      await streamSessionMessages(session, (message) => {
+        if (message.type !== 'user') return;
+        const display = extractTextContent(message.message?.content);
+        if (!display.trim()) return;
+        entries.push({
+          source: 'codex',
+          sessionId: session.sessionId,
+          timestamp: timestampDate(message.timestamp)?.toISOString() || null,
+          projectPath: session.project,
+          display
+        });
+      });
+    }
   }
 
   if (include('kimi')) {

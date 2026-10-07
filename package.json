@@ -1,6 +1,6 @@
 {
   "name": "@udx/sessions",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "Search, browse, and export Claude Code, Codex, and Kimi session transcripts from the command line.",
   "main": "index.js",
   "type": "module",
