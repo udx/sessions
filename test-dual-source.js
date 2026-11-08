@@ -230,7 +230,7 @@ writeFileSync(
     createdAt: iso(-9_000),
     updatedAt: iso(-1_000),
     title: 'Kimi unique needle',
-    workDir: '/workspace/shared',
+    cwd: '/workspace/shared',
     agents: { main: { homedir: path.join(kimiModernDir, 'agents', 'main'), type: 'main' } }
   }) + '\n'
 );
@@ -613,6 +613,9 @@ test('list discovers modern and legacy Kimi sessions with their projects', () =>
   assert(modern, 'modern session discovered');
   assert(legacy, 'legacy session discovered');
   assert.equal(modern.project, '/workspace/shared');
+  assert.equal(modern.title, 'Kimi unique needle');
+  assert.equal(modern.startedAt, iso(-9_000));
+  assert.equal(modern.archived, false);
   assert.equal(modern.format, 'wire');
   assert.equal(legacy.project, '/workspace/kimi-legacy');
   assert.equal(legacy.format, 'context');
@@ -746,6 +749,7 @@ writeJsonl(desktopFile, [
   codexMeta(desktopId, '/workspace/desktop'),
   responseMessage('user', '<environment_context>internal desktop environment</environment_context>', -9_900),
   responseMessage('user', '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>', -9_800),
+  responseMessage('user', '<external_codex_apps_selected_page_part_1_of_1>internal desktop snapshot</external_codex_apps_selected_page_part_1_of_1>', -9_750),
   responseMessage('user', '<recommended_plugins>internal desktop plugins</recommended_plugins>', -9_700),
   codexContext('/workspace/desktop'),
   responseMessage('user', 'Desktop prompt needle.', -8_000),
@@ -770,6 +774,7 @@ test('desktop list uses the real prompt and show preserves custom tool calls', (
 
 test('desktop context stays out of search and all export formats', () => {
   assert.equal(json(['search', 'external_codex_apps_open_page', '--source', 'codex'], desktopEnv).length, 0);
+  assert.equal(json(['search', 'internal desktop snapshot', '--source', 'codex'], desktopEnv).length, 0);
   assert.equal(json(['search', 'internal desktop plugins', '--source', 'codex'], desktopEnv).length, 0);
   assert.equal(json(['search', 'Desktop prompt needle', '--source', 'codex'], desktopEnv).length, 2);
   for (const format of ['md', 'text', 'json']) {

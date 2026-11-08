@@ -1,14 +1,14 @@
 {
   "name": "@udx/sessions",
-  "version": "1.6.1",
-  "description": "Search, browse, and export Claude Code, Codex, and Kimi session transcripts from the command line.",
+  "version": "1.9.1",
+  "description": "Search, browse, export, and monitor Claude Code, Codex, and Kimi sessions from the CLI or a local dashboard.",
   "main": "index.js",
   "type": "module",
   "bin": {
     "sessions": "index.js"
   },
   "scripts": {
-    "test": "node test.js && node test-dual-source.js"
+    "test": "node test.js && node test-dual-source.js && node test-server.js && node test-markdown.js"
   },
   "keywords": [
     "claude",
@@ -26,7 +26,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/udx/udx.dev",
+    "url": "git+https://github.com/udx/udx.dev.git",
     "directory": "tools/sessions"
   },
   "homepage": "https://github.com/udx/udx.dev/tree/main/tools/sessions",

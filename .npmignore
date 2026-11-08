@@ -1,5 +1,8 @@
 # Development files
 test.js
+test-dual-source.js
+test-server.js
+test-markdown.js
 .git
 .github
 .gitignore
