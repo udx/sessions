@@ -157,6 +157,7 @@ Kimi Code sessions come in two on-disk generations, and both are read. Modern se
 ### 1.9.1
 - Render common Markdown in first prompts and recent conversation, including links, lists, headings, code, and tables
 - Keep raw HTML escaped, block unsafe links, and avoid loading external images
+- Render bare URLs without recursive links and copy canonical Kimi `session_` IDs for native resume
 - Added regression and browser checks for formatted output, XSS safety, and mobile layout
 
 ### 1.9.0

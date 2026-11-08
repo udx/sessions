@@ -11,7 +11,8 @@
     anchor.href = url.href;
     anchor.target = '_blank';
     anchor.rel = 'noopener noreferrer nofollow';
-    appendInline(anchor, label || url.href);
+    if (label === value) anchor.textContent = label;
+    else appendInline(anchor, label || url.href);
     return anchor;
   }
 

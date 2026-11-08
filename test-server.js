@@ -157,7 +157,7 @@ try {
   assert.equal(kimi.title, 'Kimi dashboard fixture');
   assert.equal(kimi.messageCount, 2);
   assert.equal(kimi.model, 'kimi-test');
-  assert.equal(kimi.resumeCommand, `cd '/workspace/kimi' && kimi --session '${KIMI_ID}'`);
+  assert.equal(kimi.resumeCommand, `cd '/workspace/kimi' && kimi --session 'session_${KIMI_ID}'`);
   assert.equal(kimi.viewCommand, `sessions show 'kimi:${KIMI_ID}'`);
   assert.equal('filePath' in kimi, false);
   for (const session of data.sessions) {

@@ -49,7 +49,7 @@ function resumeCommand(session) {
     ? `claude --resume ${id}`
     : session.source === 'codex'
       ? `codex resume ${id}`
-      : `kimi --session ${id}`;
+      : `kimi --session ${shellQuote(`session_${session.sessionId}`)}`;
   const project = session.project || '';
   return path.isAbsolute(project) ? `cd ${shellQuote(project)} && ${command}` : command;
 }

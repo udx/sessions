@@ -85,5 +85,15 @@ assert.equal(links[0].target, '_blank');
 assert.equal(links[0].rel, 'noopener noreferrer nofollow');
 assert(result.textContent.includes('[Unsafe](javascript:alert(1))'));
 console.log('  ✓ Markdown renders common blocks and inline formatting');
-console.log('  ✓ raw HTML and unsafe links cannot execute\n');
-console.log('2 passed, 0 failed\n');
+console.log('  ✓ raw HTML and unsafe links cannot execute');
+
+const bareUrls = render('Open http://localhost:4220/ and **https://example.com/docs**. Next.');
+const bareUrlLinks = elements(bareUrls, 'a');
+assert.equal(bareUrlLinks.length, 2);
+assert.equal(bareUrlLinks[0].href, 'http://localhost:4220/');
+assert.equal(bareUrlLinks[0].textContent, 'http://localhost:4220/');
+assert.equal(bareUrlLinks[1].href, 'https://example.com/docs');
+assert.equal(bareUrlLinks[1].textContent, 'https://example.com/docs');
+assert.equal(elements(bareUrls, 'strong').length, 1);
+console.log('  ✓ bare URLs render as links without recursion or Markdown delimiters\n');
+console.log('3 passed, 0 failed\n');
