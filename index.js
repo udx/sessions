@@ -9,6 +9,7 @@ import { createInterface } from 'readline';
 import { createHash } from 'crypto';
 import os from 'os';
 import { fileURLToPath } from 'url';
+import { displayUrl, isLoopbackUrl, isValidIndexName, loadConfig } from './config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(await fs.readFile(path.join(__dirname, 'package.json'), 'utf8'));
@@ -727,9 +728,35 @@ function normalizeCodexRecord(data, state) {
   return [];
 }
 
+// Claude Code stores a prompt typed while the agent is still working as a
+// queued command attachment, not a user record. Those are as much the user's
+// words as any other prompt. The same attachment type also carries task
+// notifications, which are not.
+function claudeQueuedPrompt(data) {
+  const attachment = data.attachment;
+  if (!attachment || attachment.type !== 'queued_command' || attachment.commandMode !== 'prompt') return null;
+  if (attachment.origin?.kind && attachment.origin.kind !== 'human') return null;
+  const content = typeof attachment.prompt === 'string'
+    ? [{ type: 'text', text: attachment.prompt }]
+    : Array.isArray(attachment.prompt) ? attachment.prompt.filter(block => block && typeof block === 'object') : [];
+  if (!hasTextContent(content)) return null;
+  return {
+    type: 'user',
+    source: 'claude',
+    queued: true,
+    cwd: data.cwd,
+    timestamp: attachment.timestamp || data.timestamp,
+    message: { role: 'user', content }
+  };
+}
+
 async function streamSessionMessages(session, callback) {
   if (session.source === 'claude') {
     await streamLines(session.filePath, (data) => {
+      if (data.type === 'attachment') {
+        const queued = claudeQueuedPrompt(data);
+        return queued ? callback(queued) : undefined;
+      }
       if (!['user', 'assistant', 'summary'].includes(data.type)) return;
       return callback({ ...data, source: 'claude' });
     });
@@ -982,7 +1009,7 @@ function formatMessageBlock(msg, opts = {}) {
   if (msg.type === 'user') {
     const text = extractTextContent(msg.message?.content);
     if (!text || !text.trim()) return null;
-    const header = c.bold.cyan('\u25b6 You') + c.dim(` ${ts}`);
+    const header = c.bold.cyan('\u25b6 You') + c.dim(` ${ts}`) + (opts.tag || '');
     return header + '\n' + wrapText(text, termWidth);
   }
 
@@ -1006,7 +1033,7 @@ function formatMessageBlock(msg, opts = {}) {
 
     if (parts.length === 0) return null;
 
-    const header = c.bold.green(`\u25c0 ${speakerName(msg.source)}`) + c.dim(` (${modelName}) ${ts}`);
+    const header = c.bold.green(`\u25c0 ${speakerName(msg.source)}`) + c.dim(` (${modelName}) ${ts}`) + (opts.tag || '');
     return header + '\n' + parts.join('\n');
   }
 
@@ -1027,6 +1054,680 @@ function parseActiveMinutes(value) {
     throw new InvalidArgumentError('active minutes must be a positive number');
   }
   return minutes;
+}
+
+function parseCount(value) {
+  const count = Number(value);
+  if (!Number.isInteger(count) || count < 1) {
+    throw new InvalidArgumentError('must be a positive integer');
+  }
+  return count;
+}
+
+function parseSeq(value) {
+  const seq = Number(value);
+  if (!Number.isInteger(seq) || seq < 0) {
+    throw new InvalidArgumentError('must be a message position such as 12');
+  }
+  return seq;
+}
+
+function parseRole(value) {
+  const role = String(value).toLowerCase();
+  if (role === 'you') return 'user';
+  if (role !== 'user' && role !== 'assistant') {
+    throw new InvalidArgumentError('role must be user or assistant');
+  }
+  return role;
+}
+
+function parseSearchSort(value) {
+  const sort = String(value).toLowerCase();
+  if (sort !== 'relevance' && sort !== 'recent') {
+    throw new InvalidArgumentError('sort must be relevance or recent');
+  }
+  return sort;
+}
+
+function sinceFromOptions(opts) {
+  return opts.days ? daysToSinceDate(parseInt(opts.days)) : opts.since ? new Date(opts.since) : null;
+}
+
+function plural(count, word) {
+  return `${count.toLocaleString('en-US')} ${word}${count === 1 ? '' : (word.endsWith('ch') ? 'es' : 's')}`;
+}
+
+// --- search rendering shared by both backends ---
+
+// Lines around each literal occurrence of the query, with the match painted.
+function literalSnippets(text, query) {
+  const lowerQuery = query.toLowerCase();
+  const pattern = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+  const lines = cleanSnippet(text).split('\n').filter(l => l.trim());
+  const matchLines = [];
+  const seen = new Set();
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].toLowerCase().includes(lowerQuery)) continue;
+    const start = Math.max(0, i - 1);
+    const end = Math.min(lines.length - 1, i + 1);
+    const snippet = [];
+    for (let j = start; j <= end; j++) {
+      if (seen.has(j)) continue;
+      seen.add(j);
+      let l = lines[j];
+      if (l.length > 200) l = l.slice(0, 200) + '…';
+      if (j === i) l = l.replace(pattern, m => c.bold.yellow(m));
+      snippet.push(l);
+    }
+    if (snippet.length > 0) matchLines.push(snippet.join('\n'));
+  }
+  return matchLines;
+}
+
+// "you" is reserved for what the user typed; text a tool injected under the
+// user role (notifications, command output) reads as "system".
+function speakerTag(r) {
+  if (r.injected) return c.dim('system');
+  return r.type === 'user' ? c.cyan('you') : c.green(r.source);
+}
+
+function printSearchMatch(r, totalInSession) {
+  const time = r.timestamp ? formatRelativeTime(r.timestamp) : '';
+  const who = speakerTag(r);
+  const hits = totalInSession > 1 ? c.dim(` (${totalInSession} matches in session)`) : '';
+  // The message position, when known, is what "show --around" takes.
+  const position = r.seq === undefined ? '' : c.dim(` #${r.seq}`);
+  console.log(
+    c.yellow(r.shortId) + ' ' +
+    sourceTag(r.source) + ' ' +
+    c.dim(r.project) + ' ' +
+    who + ' ' +
+    c.dim(time) +
+    position +
+    hits
+  );
+  printSearchBody(r);
+}
+
+function printSearchBody(r) {
+  const contextLine = (ctx) => {
+    const ctxWho = ctx.type === 'user' ? c.dim.cyan('  [you]') : c.dim.green(`  [${r.source}]`);
+    console.log(ctxWho + c.dim(` ${ctx.text}`));
+  };
+  for (const ctx of (r.contextMessages || []).filter(m => m.position === 'before')) contextLine(ctx);
+  for (const snippet of r.snippets) {
+    console.log('  ' + snippet.split('\n').map(l => '  ' + l).join('\n'));
+  }
+  for (const ctx of (r.contextMessages || []).filter(m => m.position === 'after')) contextLine(ctx);
+}
+
+function printSessionPrompts(prompts) {
+  if (prompts.length === 0) return;
+  console.log(c.dim('  --- session prompts ---'));
+  for (const p of prompts) {
+    console.log(c.dim(`    ${p.time}`) + `  ${p.text}`);
+  }
+}
+
+// --- Elasticsearch backend ---
+
+// Turns a highlighted fragment into one painted terminal line.
+function paintFragment(fragment, open, close) {
+  return fragment
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(open)
+    .map((part, index) => {
+      if (index === 0) return part;
+      const [match, ...rest] = part.split(close);
+      return c.bold.yellow(match) + rest.join('');
+    })
+    .join('');
+}
+
+function elasticSnippets(hit, query, mode, elastic) {
+  if (mode === 'literal') {
+    const literal = hit.text ? literalSnippets(hit.text, query).slice(0, 2) : [];
+    if (literal.length > 0) return literal;
+  }
+  const paint = fragment => paintFragment(fragment, elastic.HIGHLIGHT_OPEN, elastic.HIGHLIGHT_CLOSE);
+  const snippets = hit.fragments.slice(0, 2).map(paint);
+  if (hit.toolFragments.length > 0) {
+    const label = hit.tools.length > 0 ? hit.tools.join(', ') : 'tool';
+    snippets.push(c.dim(`\u{1f527} ${label}: `) + paint(hit.toolFragments[0]));
+  }
+  if (snippets.length === 0 && hit.preview) snippets.push(hit.preview);
+  return snippets;
+}
+
+function describeScope(scope = {}) {
+  const parts = [];
+  if (scope.source && scope.source !== 'all') parts.push(`${scope.source} only`);
+  if (scope.project) parts.push(`project ${scope.project}`);
+  if (scope.since) parts.push(`since ${String(scope.since).slice(0, 10)}`);
+  return parts.join(', ');
+}
+
+// Search answers from the index as of its last sync, so say how old that is.
+function snapshotFooter(snapshot) {
+  const synced = snapshot.syncedAt ? formatRelativeTime(snapshot.syncedAt) : 'at an unknown time';
+  const ageMs = snapshot.syncedAt ? Date.now() - snapshot.syncedAt.getTime() : Infinity;
+  const hint = ageMs > 60 * 60_000 ? '; run "sessions sync" to include newer messages' : '';
+  return `Elasticsearch index synced ${synced}${hint}`;
+}
+
+function formatLabels(labels) {
+  return Object.entries(labels || {})
+    .map(([key, value]) => `${key}=${Array.isArray(value) ? value.join(',') : value}`)
+    .join(' ');
+}
+
+function collectOption(value, previous = []) {
+  return [...previous, value];
+}
+
+// Shown when a search had to loosen the match to find anything.
+const SEARCH_MODE_NOTES = {
+  prefix: 'No exact word match; showing words that start with your terms.',
+  literal: 'No word match; showing literal substring matches.',
+  tools: 'No message text matches; showing tool calls (commands, paths, arguments) that do.',
+  session: 'No single message contains every term; showing sessions that contain them all.',
+  fuzzy: 'No exact match; showing similar spellings.',
+  partial: 'No message contains every term; showing the closest matches.'
+};
+
+// With auto_sync set, a search first brings the index up to date when its
+// last sync is older than that many minutes. Only changed transcripts are
+// re-read, so this usually takes a second or two.
+async function refreshIfStale(elastic, client, config, snapshot) {
+  const es = config.elasticsearch;
+  if (!es.autoSyncMinutes || !snapshot.syncedAt) return snapshot;
+  if (Date.now() - snapshot.syncedAt.getTime() < es.autoSyncMinutes * 60_000) return snapshot;
+  if (snapshot.meta?.schema !== elastic.SCHEMA_VERSION) return snapshot;
+  if (!isLoopbackUrl(es.url) && !es.allowRemote) return snapshot;
+  try {
+    const everything = await getSessionFiles(null, 'all');
+    await elastic.syncIndex({
+      client,
+      alias: es.index,
+      keep: es.keep,
+      sessions: everything,
+      allSessionKeys: everything.map(sessionKey),
+      reader: { streamSessionMessages, extractTextContent, isDisplayPrompt },
+      scope: { source: 'all', project: null, since: null },
+      toolVersion: pkg.version
+    });
+    return (await elastic.currentSnapshot(client, es.index)) || snapshot;
+  } catch (error) {
+    if (error.name !== 'ElasticError') throw error;
+    console.error(c.dim(`Could not refresh the index (${error.message}); results are as of the last sync.`));
+    return snapshot;
+  }
+}
+
+function projectName(project) {
+  const name = String(project || '').replace(/\/+$/, '').split('/').pop();
+  return name || String(project || '');
+}
+
+// One line per facet, in sessions: where the matches are and how to narrow.
+function printFacets(facets) {
+  const line = (label, buckets, name = bucket => bucket.value) => {
+    if (buckets.length < 2) return;
+    console.log(c.dim(`${label} ${buckets.map(bucket => `${name(bucket)} ${bucket.sessions}`).join(', ')}`));
+  };
+  line('Projects:', facets.projects, bucket => projectName(bucket.value));
+  line('When:', facets.when);
+  line('Sources:', facets.sources);
+}
+
+// Returns true when the search was answered, or a reason it could not be.
+async function runElasticSearch(query, opts, config) {
+  const elastic = await import('./elastic.js');
+  const es = config.elasticsearch;
+  const client = elastic.createClient({ ...es, timeoutMs: 20_000 });
+  let snapshot = await elastic.currentSnapshot(client, es.index);
+  if (!snapshot) {
+    return `Elasticsearch at ${client.url} has no "${es.index}" index yet (run "sessions sync")`;
+  }
+  snapshot = await refreshIfStale(elastic, client, config, snapshot);
+
+  let labels;
+  try {
+    labels = (opts.label || []).map(elastic.parseLabel);
+  } catch (error) {
+    failWith(error.message);
+  }
+
+  // --session drills into one session: its matches in the order they were said.
+  let inSession = null;
+  if (opts.session) {
+    const found = await elastic.findIndexedSessions(client, snapshot.index, opts.session);
+    if (found.length === 0) failWith(`No indexed session matches "${opts.session}".`);
+    if (found.length > 1) {
+      failWith(`"${opts.session}" matches several sessions: ${found.map(s => `${s.source}:${s.sessionId}`).join(', ')}`);
+    }
+    inSession = found[0];
+  }
+
+  const limit = parseInt(opts.limit);
+  const contextN = parseInt(opts.context);
+  const result = await elastic.searchSnapshot(client, snapshot.index, {
+    query,
+    literal: Boolean(opts.literal),
+    sort: opts.sort || 'relevance',
+    limit,
+    perSession: opts.perSession || 1,
+    includeTools: Boolean(opts.tools),
+    inSession: inSession ? inSession.sessionKey : null,
+    filters: {
+      source: opts.source,
+      project: opts.project,
+      since: sinceFromOptions(opts),
+      role: opts.role,
+      tool: opts.tool,
+      labels
+    }
+  });
+
+  // -n caps the matches shown, as it does when scanning files. Sessions come
+  // best first and each contributes up to --per-session matches.
+  const hits = result.groups.flatMap(group => group.hits.map(hit => ({ hit, group }))).slice(0, limit);
+  const shownSessions = new Set(hits.map(({ hit }) => hit.sessionKey));
+  const [context, sessionLabels] = await Promise.all([
+    elastic.fetchContext(client, snapshot.index, hits.map(({ hit }) => hit), contextN),
+    elastic.getLabels(client, snapshot.index, [...shownSessions])
+  ]);
+  const rows = hits.map(({ hit, group }) => {
+    const row = {
+      sessionId: hit.sessionId,
+      shortId: hit.shortId,
+      source: hit.source,
+      project: hit.project,
+      timestamp: hit.timestamp,
+      type: hit.role,
+      model: hit.model || undefined,
+      snippets: elasticSnippets(hit, query, result.mode, elastic),
+      contextMessages: (context.get(`${hit.sessionKey}:${hit.seq}`) || []).map(message => ({ ...message, text: truncate(message.text, 150) })),
+      score: hit.score,
+      matchesInSession: group.matchesInSession,
+      matchMode: result.mode,
+      seq: hit.seq,
+      tools: hit.tools,
+      _sessionKey: hit.sessionKey
+    };
+    if (hit.injected) row.injected = true;
+    // Label fields appear only when something is labeled.
+    const ofSession = sessionLabels.get(hit.sessionKey);
+    if (ofSession) row.sessionLabels = ofSession;
+    if (hit.labels) row.labels = hit.labels;
+    return row;
+  });
+
+  if (opts.json) {
+    console.log(JSON.stringify(rows.map(({ _sessionKey, ...rest }) => rest), null, 2));
+    return true;
+  }
+
+  if (rows.length === 0) {
+    console.log(inSession ? `No matches for "${query}" in ${inSession.shortId}.` : `No matches for "${query}".`);
+    console.log(c.dim(snapshotFooter(snapshot)));
+    return true;
+  }
+
+  if (inSession) {
+    const shown = rows.length < result.totalMessages ? c.dim(` (showing ${rows.length})`) : '';
+    console.log(c.bold(`${plural(result.totalMessages, 'match')} in `) + c.yellow(inSession.shortId) + ' ' +
+      sourceTag(inSession.source) + ' ' + c.dim(inSession.project) + shown);
+  } else {
+    const shown = shownSessions.size < result.totalSessions ? c.dim(` (showing ${shownSessions.size})`) : '';
+    console.log(c.bold(`${plural(result.totalMessages, 'match')} in ${plural(result.totalSessions, 'session')}`) + shown);
+  }
+  if (!opts.literal && SEARCH_MODE_NOTES[result.mode]) console.log(c.dim(SEARCH_MODE_NOTES[result.mode]));
+
+  const prompts = opts.preview
+    ? await elastic.fetchPrompts(client, snapshot.index, [...shownSessions])
+    : new Map();
+  const previewShown = new Set();
+  const spaced = contextN > 0 || Boolean(opts.preview);
+  for (const row of rows) {
+    if (inSession) {
+      const time = row.timestamp ? formatRelativeTime(row.timestamp) : '';
+      console.log(`${c.dim(`#${row.seq}`)} ${speakerTag(row)} ${c.dim(time)}`);
+      printSearchBody(row);
+    } else {
+      printSearchMatch(row, row.matchesInSession);
+    }
+    const rowLabels = formatLabels(inSession ? row.labels : { ...row.sessionLabels, ...row.labels });
+    if (rowLabels) console.log(c.dim(`    labels: ${rowLabels}`));
+    if (opts.preview && !previewShown.has(row._sessionKey)) {
+      previewShown.add(row._sessionKey);
+      printSessionPrompts((prompts.get(row._sessionKey) || []).map(p => ({
+        text: truncate(p.text, 100),
+        time: p.timestamp ? formatRelativeTime(p.timestamp) : ''
+      })));
+    }
+    if (spaced) console.log('');
+  }
+
+  // What else is there, and how to get closer.
+  if (!spaced) console.log('');
+  const top = rows[0];
+  if (inSession) {
+    console.log(c.dim(`Read around a match: sessions show ${top.shortId} --around ${top.seq}`));
+  } else {
+    if (shownSessions.size < result.totalSessions) printFacets(result.facets);
+    console.log(c.dim(`Drill in: add --session ${top.shortId} for every match in that session, or run: sessions show ${top.shortId} --around ${top.seq}`));
+  }
+  console.log(c.dim(snapshotFooter(snapshot)));
+  return true;
+}
+
+// Decides which backend answers a search. Returns true when Elasticsearch
+// handled it; false means the caller should scan session files.
+async function searchWithElasticsearch(query, opts) {
+  const config = await loadConfig({ overrides: { backend: opts.local ? 'local' : undefined } });
+  if (config.warning) console.error(c.yellow(config.warning));
+  const es = config.elasticsearch;
+  const backend = config.search.backend;
+  const needsElastic = Boolean(opts.tools || opts.tool || opts.label?.length || opts.session);
+  const useElastic = backend === 'elasticsearch' || (backend === 'auto' && Boolean(es.url));
+
+  if (!useElastic) {
+    if (needsElastic) {
+      console.error(c.red(es.url
+        ? '--tools, --tool, --label and --session need the Elasticsearch index, and this search is set to scan files (--local or search.backend: local).'
+        : '--tools, --tool, --label and --session use the optional Elasticsearch index. Run "sessions sync" to set one up.'));
+      process.exit(1);
+    }
+    return false;
+  }
+
+  let failure;
+  if (!es.url) {
+    failure = 'No Elasticsearch URL is configured (set SESSIONS_ES_URL or elasticsearch.url in ~/.sessions/config.yaml)';
+  } else {
+    try {
+      const outcome = await runElasticSearch(query, opts, config);
+      if (outcome === true) return true;
+      failure = outcome;
+    } catch (error) {
+      if (error.name !== 'ElasticError') throw error;
+      failure = error.message;
+    }
+  }
+
+  if (backend === 'elasticsearch' || needsElastic) {
+    console.error(c.red(failure));
+    process.exit(1);
+  }
+  console.error(c.dim(`${failure}. Scanning session files instead.`));
+  return false;
+}
+
+const LOCAL_ES_COMMAND = 'docker run -d --name sessions-es -p 127.0.0.1:9220:9200 ' +
+  '-e discovery.type=single-node -e xpack.security.enabled=false ' +
+  '-e ES_JAVA_OPTS="-Xms1g -Xmx1g" elasticsearch:8.19.25';
+
+function failWith(message) {
+  console.error(c.red(message));
+  process.exit(1);
+}
+
+async function printSyncStatus(elastic, client, es, opts) {
+  const [info, details] = await Promise.all([elastic.clusterInfo(client), elastic.snapshotDetails(client, es.index)]);
+  let pending = null;
+  let labels = [];
+  if (details) {
+    const local = await getSessionFiles(null, 'all');
+    [pending, labels] = await Promise.all([
+      elastic.indexedSessions(client, details.index).then(indexed => elastic.compareWithIndex(local, indexed)),
+      elastic.labelSummary(client, details.index)
+    ]);
+  }
+
+  if (opts.json) {
+    console.log(JSON.stringify({
+      url: client.url,
+      version: info.version,
+      alias: es.index,
+      index: details ? {
+        name: details.index,
+        createdAt: details.createdAt,
+        syncedAt: details.syncedAt,
+        lastSync: details.meta?.last_sync || null,
+        sessions: details.sessions,
+        messages: details.messages,
+        storeBytes: details.storeBytes,
+        pending,
+        labels
+      } : null
+    }, null, 2));
+    return;
+  }
+
+  console.log(`${c.bold('Elasticsearch')}  ${client.url} ${c.dim(`(${info.version})`)}`);
+  if (!details) {
+    console.log(`${c.bold('Index')}          none for "${es.index}" yet; run "sessions sync"`);
+    return;
+  }
+  const lastScope = describeScope(details.meta?.last_sync?.scope);
+  console.log(`${c.bold('Index')}          ${es.index} -> ${details.index}`);
+  console.log(`${c.bold('Synced')}         ${details.syncedAt
+    ? `${formatRelativeTime(details.syncedAt)} ${c.dim(`(${details.syncedAt.toISOString()}${lastScope ? `, ${lastScope}` : ''})`)}`
+    : 'unknown'}`);
+  console.log(`${c.bold('Contents')}       ${plural(details.messages, 'message')} in ${plural(details.sessions, 'session')}, ${formatSize(details.storeBytes)} on disk`);
+  const waiting = pending.changed + pending.added;
+  const parts = [];
+  if (waiting > 0) parts.push(`${pending.changed} changed, ${pending.added} new ${c.dim('(run "sessions sync")')}`);
+  if (pending.missing > 0) parts.push(`${pending.missing} no longer on disk`);
+  console.log(`${c.bold('Since sync')}     ${parts.length > 0 ? parts.join('; ') : 'no local changes'}`);
+  if (labels.length > 0) {
+    console.log(`${c.bold('Labels')}         ${labels.map(entry => `${entry.key} ${c.dim(`(${plural(entry.values.length, 'value')})`)}`).join(', ')}`);
+  }
+}
+
+async function runSync(opts) {
+  const config = await loadConfig({
+    overrides: { url: opts.esUrl, index: opts.index, keep: opts.keep, allowRemote: opts.allowRemote }
+  });
+  if (config.warning) console.error(c.yellow(config.warning));
+  const es = config.elasticsearch;
+
+  if (!isValidIndexName(es.index)) {
+    failWith(`Invalid index name "${es.index}". Use lowercase letters, digits, ".", "_" or "-", starting with a letter or digit.`);
+  }
+  if (!es.url && !opts.dryRun) {
+    failWith(
+      'No Elasticsearch URL is configured. Elasticsearch is optional; to try it on this machine:\n' +
+      `  ${LOCAL_ES_COMMAND}\n  export SESSIONS_ES_URL=http://127.0.0.1:9220\n  sessions sync\n` +
+      'To keep it, set elasticsearch.url in ~/.sessions/config.yaml instead of the export. --es-url works too.'
+    );
+  }
+  if (es.url && !opts.status && !opts.dryRun && !isLoopbackUrl(es.url) && !es.allowRemote) {
+    failWith(
+      `Refusing to touch ${displayUrl(es.url)}: it is not this machine, and transcripts can hold private material.\n` +
+      'Pass --allow-remote or set elasticsearch.allow_remote: true to send them there anyway.'
+    );
+  }
+
+  const elastic = await import('./elastic.js');
+  const client = es.url ? elastic.createClient(es) : null;
+
+  try {
+    if (opts.status) {
+      await printSyncStatus(elastic, client, es, opts);
+      return;
+    }
+
+    if (opts.drop) {
+      const removed = await elastic.dropSnapshots(client, es.index);
+      if (opts.json) {
+        console.log(JSON.stringify({ removed }, null, 2));
+        return;
+      }
+      console.log(removed.length === 0
+        ? `No "${es.index}" index to remove.`
+        : `Removed ${removed.join(', ')}`);
+      return;
+    }
+
+    const everything = await getSessionFiles(null, 'all');
+    const since = sinceFromOptions(opts);
+    let sessions = opts.project || opts.source !== 'all' ? await getSessionFiles(opts.project, opts.source) : everything;
+    if (since) sessions = sessions.filter(s => s.modifiedAt >= since);
+    const info = opts.dryRun ? null : await elastic.clusterInfo(client);
+
+    const showProgress = process.stderr.isTTY && !opts.json;
+    const totals = await elastic.syncIndex({
+      client,
+      alias: es.index,
+      keep: es.keep,
+      sessions,
+      allSessionKeys: everything.map(sessionKey),
+      reader: { streamSessionMessages, extractTextContent, isDisplayPrompt },
+      scope: { source: opts.source, project: opts.project || null, since: since ? since.toISOString() : null },
+      toolVersion: pkg.version,
+      rebuild: Boolean(opts.rebuild),
+      prune: Boolean(opts.prune),
+      dryRun: Boolean(opts.dryRun),
+      onProgress: ({ done, total, messages }) => {
+        if (showProgress) process.stderr.write(`\r  ${done}/${total} sessions, ${messages.toLocaleString('en-US')} messages`);
+      }
+    });
+    if (showProgress) process.stderr.write(`\r${' '.repeat(60)}\r`);
+
+    if (opts.json) {
+      console.log(JSON.stringify({ ...totals, url: client?.url || null, alias: es.index, version: info?.version || null }, null, 2));
+    } else {
+      const counted = `${plural(totals.sessions, 'session')}, ${plural(totals.messages, 'message')}`;
+      let headline;
+      if (totals.dryRun) headline = `Would index ${counted}`;
+      else if (totals.mode === 'create') headline = `Indexed ${counted}`;
+      else if (totals.mode === 'rebuild') headline = `Rebuilt the index from ${counted}`;
+      else if (totals.sessions === 0) headline = `Already up to date: ${plural(totals.unchanged, 'session')} unchanged`;
+      else headline = `Synced ${plural(totals.sessions, 'changed session')}, ${plural(totals.messages, 'message')}`;
+      const detail = totals.sessions > 0 ? ` (${formatSize(totals.textChars)} of text)` : '';
+      console.log(c.bold(headline) + c.dim(`${detail} in ${(totals.durationMs / 1000).toFixed(1)}s`));
+
+      const notes = [];
+      const sources = Object.entries(totals.bySource).map(([source, count]) => `${source} ${count}`).join(', ');
+      if (sources) notes.push(totals.mode === 'update' ? `${sources}; ${plural(totals.unchanged, 'session')} unchanged` : sources);
+      if (!totals.dryRun) notes.push(`${es.index} -> ${totals.index} at ${client.url} (Elasticsearch ${info.version})`);
+      if (totals.reason === 'schema') notes.push('the index format changed, so it was rebuilt');
+      if (totals.carried.sessions > 0) notes.push(`kept ${plural(totals.carried.sessions, 'session')} outside this run as they were`);
+      if (totals.carried.enriched > 0) notes.push(`kept labels and notes on ${plural(totals.carried.enriched, 'document')}`);
+      if (totals.removed.length > 0) notes.push(`removed ${totals.removed.join(', ')}`);
+      if (totals.staleRemoved > 0) notes.push(`removed ${plural(totals.staleRemoved, 'message')} no longer in their transcripts`);
+      if (totals.pruned > 0) notes.push(`pruned ${plural(totals.pruned, 'session')} no longer on disk`);
+      else if (totals.missing > 0) notes.push(`${plural(totals.missing, 'session')} no longer on disk stay searchable; --prune removes them`);
+      if (totals.truncatedMessages > 0) notes.push(`${plural(totals.truncatedMessages, 'message')} longer than 500,000 characters indexed in part`);
+      for (const note of notes) console.log(c.dim(`  ${note}`));
+      for (const line of totals.unreadable.slice(0, 3)) console.error(c.yellow(`  skipped ${line}`));
+      if (totals.unreadable.length > 3) console.error(c.yellow(`  ...and ${totals.unreadable.length - 3} more skipped sessions`));
+    }
+    if (totals.failed > 0) {
+      console.error(c.red(`${plural(totals.failed, 'document')} failed to index; the next sync retries their sessions:`));
+      for (const sample of totals.failureSamples) console.error(c.red(`  ${sample}`));
+      process.exit(1);
+    }
+  } catch (error) {
+    if (error.name !== 'ElasticError') throw error;
+    failWith(error.message);
+  }
+}
+
+// Connects to the configured index for the label commands, or exits.
+async function requireIndex() {
+  const config = await loadConfig();
+  if (config.warning) console.error(c.yellow(config.warning));
+  const es = config.elasticsearch;
+  if (!es.url) {
+    failWith('Labels are kept in the optional Elasticsearch index. Run "sessions sync" to set one up.');
+  }
+  const elastic = await import('./elastic.js');
+  const client = elastic.createClient(es);
+  const snapshot = await elastic.currentSnapshot(client, es.index);
+  if (!snapshot) failWith(`Elasticsearch at ${client.url} has no "${es.index}" index yet (run "sessions sync")`);
+  return { elastic, client, snapshot };
+}
+
+async function runLabel(sessionId, pairs, opts) {
+  try {
+    const { elastic, client, snapshot } = await requireIndex();
+    const set = {};
+    const remove = opts.remove || [];
+    try {
+      for (const pair of pairs) {
+        const { key, value } = elastic.parseLabel(pair);
+        set[key] = value;
+      }
+      for (const key of remove) {
+        if (!elastic.isValidLabelKey(key)) throw new Error(`Invalid label key "${key}": use letters, digits, "_" or "-"`);
+      }
+    } catch (error) {
+      failWith(error.message);
+    }
+
+    const sessions = await getSessionFiles(null, opts.source);
+    let session;
+    try {
+      session = resolveSession(sessions, sessionId);
+    } catch (error) {
+      failWith(error.message);
+    }
+    if (!session) failWith(`Session not found: ${sessionId}`);
+
+    const key = sessionKey(session);
+    const id = opts.message === undefined ? key : `${key}:${opts.message}`;
+    const changing = Object.keys(set).length > 0 || remove.length > 0;
+    const labels = changing
+      ? await elastic.updateLabels(client, snapshot.index, id, { set, remove })
+      : await elastic.readLabels(client, snapshot.index, id);
+    if (labels === null) {
+      failWith(opts.message === undefined
+        ? `${key} is not in the index yet; run "sessions sync" first`
+        : `${key} has no indexed message ${opts.message}`);
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify({
+        sessionId: session.sessionId,
+        source: session.source,
+        message: opts.message ?? null,
+        labels
+      }, null, 2));
+      return;
+    }
+    const target = c.yellow(session.shortId) + ' ' + sourceTag(session.source) +
+      (opts.message === undefined ? '' : c.dim(` message ${opts.message}`));
+    console.log(`${target} ${formatLabels(labels) || c.dim('(no labels)')}`);
+  } catch (error) {
+    if (error.name !== 'ElasticError') throw error;
+    failWith(error.message);
+  }
+}
+
+async function runLabels(opts) {
+  try {
+    const { elastic, client, snapshot } = await requireIndex();
+    const summary = await elastic.labelSummary(client, snapshot.index);
+    if (opts.json) {
+      console.log(JSON.stringify(summary, null, 2));
+      return;
+    }
+    if (summary.length === 0) {
+      console.log('No labels yet. Add one with: sessions label <session-id> key=value');
+      return;
+    }
+    for (const entry of summary) {
+      const values = entry.values.map(item => `${item.value} ${c.dim(`(${plural(item.sessions, 'session')})`)}`).join(', ');
+      console.log(`${c.cyan(entry.key)}  ${values}`);
+    }
+  } catch (error) {
+    if (error.name !== 'ElasticError') throw error;
+    failWith(error.message);
+  }
 }
 
 if (process.argv[2] === '--serve') process.argv[2] = 'serve';
@@ -1137,8 +1838,33 @@ program
   .option('--days <n>', 'Only search sessions from last N days')
   .option('--preview', 'Show first few prompts per matched session')
   .option('--source <source>', 'Session source: all, claude, codex, or kimi', parseSource, 'all')
+  .option('--role <role>', 'Only match messages from: user or assistant', parseRole)
+  .option('--local', 'Scan session files even when Elasticsearch is configured')
   .option('--json', 'Output JSON')
+  .option('--session <id>', '[Elasticsearch] Every match inside one session, in the order it was said')
+  .option('--per-session <n>', '[Elasticsearch] Matches shown per session (default: 1)', parseCount)
+  .option('--sort <order>', '[Elasticsearch] Result order: relevance or recent', parseSearchSort)
+  .option('--tools', '[Elasticsearch] Also search tool calls: commands, file paths, arguments')
+  .option('--tool <name>', '[Elasticsearch] Only match messages that called this tool, e.g. Bash')
+  .option('--label <key=value>', '[Elasticsearch] Only match labeled sessions or messages (repeatable)', collectOption)
+  .option('--literal', '[Elasticsearch] Match the query as an exact substring')
+  .addHelpText('after', `
+The query is matched as a case-insensitive substring of each message.
+
+Optional: once "sessions sync" has built an Elasticsearch index, search uses
+it instead. It lists the best match of each session, then where and when the
+rest are, and queries understand:
+  deploy staging        messages containing both words, in any form
+  "exact phrase"        those words, in that order
+  index.js              identifiers and paths match as a unit
+  deploy OR release     either word (grep style works too: deploy\\|release)
+  deploy NOT staging    exclude messages containing a word
+To get closer to a result:
+  sessions search "deploy" --session a1b2c3d4     every match in that session
+  sessions show a1b2c3d4 --around 42              the conversation around #42`)
   .action(async (query, opts) => {
+    if (await searchWithElasticsearch(query, opts)) return;
+
     let sessions = await getSessionFiles(opts.project, opts.source);
     const limit = parseInt(opts.limit);
     const contextN = parseInt(opts.context);
@@ -1147,7 +1873,7 @@ program
     const sessionMatchCounts = new Map();
     const sessionTotalCounts = new Map();
 
-    const since = opts.days ? daysToSinceDate(parseInt(opts.days)) : opts.since ? new Date(opts.since) : null;
+    const since = sinceFromOptions(opts);
     if (since) {
       sessions = sessions.filter(s => s.modifiedAt >= since);
     }
@@ -1165,6 +1891,7 @@ program
       let totalHits = 0;
       for (let mi = 0; mi < allMessages.length; mi++) {
         const data = allMessages[mi];
+        if (opts.role && data.type !== opts.role) continue;
         const text = extractTextContent(data.message?.content);
         if (!text || !text.toLowerCase().includes(lowerQuery)) continue;
 
@@ -1173,29 +1900,7 @@ program
         const count = sessionMatchCounts.get(key) || 0;
         sessionMatchCounts.set(key, count + 1);
 
-        const cleaned = cleanSnippet(text);
-        const lines = cleaned.split('\n').filter(l => l.trim());
-        const matchLines = [];
-        const seen = new Set();
-        for (let i = 0; i < lines.length; i++) {
-          if (lines[i].toLowerCase().includes(lowerQuery)) {
-            const start = Math.max(0, i - 1);
-            const end = Math.min(lines.length - 1, i + 1);
-            const snippet = [];
-            for (let j = start; j <= end; j++) {
-              if (seen.has(j)) continue;
-              seen.add(j);
-              let l = lines[j];
-              if (l.length > 200) l = l.slice(0, 200) + '\u2026';
-              if (j === i) {
-                l = l.replace(new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi'),
-                  m => c.bold.yellow(m));
-              }
-              snippet.push(l);
-            }
-            if (snippet.length > 0) matchLines.push(snippet.join('\n'));
-          }
-        }
+        const matchLines = literalSnippets(text, query);
 
         const contextMessages = [];
         if (contextN > 0) {
@@ -1251,33 +1956,7 @@ program
     const previewShown = new Set();
 
     for (const r of sorted) {
-      const time = r.timestamp ? formatRelativeTime(r.timestamp) : '';
-      const who = r.type === 'user' ? c.cyan('you') : c.green(r.source);
-      const totalInSession = sessionTotalCounts.get(sessionKey(r)) || 0;
-      const hits = totalInSession > 1 ? c.dim(` (${totalInSession} matches in session)`) : '';
-      console.log(
-        c.yellow(r.shortId) + ' ' +
-        sourceTag(r.source) + ' ' +
-        c.dim(r.project) + ' ' +
-        who + ' ' +
-        c.dim(time) +
-        hits
-      );
-      if (r.contextMessages) {
-        for (const ctx of r.contextMessages.filter(m => m.position === 'before')) {
-          const ctxWho = ctx.type === 'user' ? c.dim.cyan('  [you]') : c.dim.green(`  [${r.source}]`);
-          console.log(ctxWho + c.dim(` ${ctx.text}`));
-        }
-      }
-      for (const snippet of r.snippets) {
-        console.log('  ' + snippet.split('\n').map(l => '  ' + l).join('\n'));
-      }
-      if (r.contextMessages) {
-        for (const ctx of r.contextMessages.filter(m => m.position === 'after')) {
-          const ctxWho = ctx.type === 'user' ? c.dim.cyan('  [you]') : c.dim.green(`  [${r.source}]`);
-          console.log(ctxWho + c.dim(` ${ctx.text}`));
-        }
-      }
+      printSearchMatch(r, sessionTotalCounts.get(sessionKey(r)) || 0);
       if (opts.preview && !previewShown.has(sessionKey(r))) {
         previewShown.add(sessionKey(r));
         const prompts = [];
@@ -1293,12 +1972,7 @@ program
             }
           }
         });
-        if (prompts.length > 0) {
-          console.log(c.dim('  --- session prompts ---'));
-          for (const p of prompts) {
-            console.log(c.dim(`    ${p.time}`) + `  ${p.text}`);
-          }
-        }
+        printSessionPrompts(prompts);
       }
       console.log('');
     }
@@ -1313,6 +1987,8 @@ program
   .option('--preview', 'Show first few user prompts only (quick overview)')
   .option('-n, --limit <n>', 'Max messages to show')
   .option('--offset <n>', 'Skip first N messages', '0')
+  .option('--around <position>', 'Show the conversation around a message position (the #N search prints)', parseSeq)
+  .option('-C, --context <n>', 'Messages before and after --around', parseCount, 3)
   .option('--source <source>', 'Session source: all, claude, codex, or kimi', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (sessionId, opts) => {
@@ -1332,6 +2008,57 @@ program
     if (!session) {
       console.error(c.red(`Session not found: ${sessionId}`));
       process.exit(1);
+    }
+
+    if (opts.around !== undefined) {
+      // Positions count every user and assistant message, the same way the
+      // search index numbers them, so a search hit can be opened directly.
+      const center = opts.around;
+      const span = opts.context;
+      const showOpts = { noTools: opts.tools === false };
+      const before = [];
+      const window = [];
+      let position = -1;
+      let after = 0;
+      await streamSessionMessages(session, (data) => {
+        if (data.type !== 'user' && data.type !== 'assistant') return;
+        position++;
+        if (formatMessageBlock(data, showOpts) === null && position !== center) return;
+        const entry = { position, data };
+        if (position < center) {
+          before.push(entry);
+          if (before.length > span) before.shift();
+        } else if (position === center) {
+          window.push(...before, entry);
+        } else {
+          if (window.length === 0) window.push(...before);
+          window.push(entry);
+          if (++after >= span) return true;
+        }
+      });
+      if (window.length === 0) window.push(...before);
+      if (position < center) {
+        console.error(c.red(`Session ${session.shortId} has ${position + 1} messages; there is no #${center}.`));
+        process.exit(1);
+      }
+
+      if (opts.json) {
+        console.log(JSON.stringify(window.map(({ position: seq, data }) => ({ seq, ...data })), null, 2));
+        return;
+      }
+      console.log(c.bold(`Session: ${session.sessionId}`));
+      console.log(c.dim(`Source: ${session.source}`));
+      console.log(c.dim(`Project: ${session.project}`));
+      console.log(c.dim(`Around #${center} of ${session.shortId}\n`));
+      for (const { position: seq, data } of window) {
+        const tag = seq === center ? c.bold.yellow(` #${seq}`) : c.dim(` #${seq}`);
+        const formatted = formatMessageBlock(data, { ...showOpts, tag });
+        if (formatted !== null) console.log(formatted + '\n');
+      }
+      const first = window[0].position;
+      const last = window[window.length - 1].position;
+      console.log(c.dim(`Earlier: sessions show ${session.shortId} --around ${Math.max(0, first - 1)}   Later: sessions show ${session.shortId} --around ${last + 1}`));
+      return;
     }
 
     const messages = [];
@@ -1727,5 +2454,52 @@ program
       console.log('');
     }
   });
+
+program
+  .command('sync')
+  .description('Optional: index sessions into Elasticsearch for fast, ranked search')
+  .option('-p, --project <path>', 'Only sync sessions whose project path matches')
+  .option('--since <date>', 'Only sync sessions modified since date (YYYY-MM-DD)')
+  .option('--days <n>', 'Only sync sessions from last N days')
+  .option('--source <source>', 'Session source: all, claude, codex, or kimi', parseSource, 'all')
+  .option('--es-url <url>', 'Elasticsearch URL (default: SESSIONS_ES_URL or ~/.sessions/config.yaml)')
+  .option('--index <name>', 'Alias and snapshot prefix (default: sessions)')
+  .option('--keep <n>', 'Snapshots to keep after syncing (default: 1)', parseCount)
+  .option('--allow-remote', 'Allow an Elasticsearch host other than this machine')
+  .option('--rebuild', 'Build a new index from the transcripts instead of updating in place')
+  .option('--prune', 'Remove sessions whose transcripts are no longer on disk')
+  .option('--status', 'Show the index and what changed locally since the last sync')
+  .option('--drop', 'Delete the index, including its labels')
+  .option('--dry-run', 'Read and count sessions without indexing them')
+  .option('--json', 'Output JSON')
+  .addHelpText('after', `
+Sync is incremental: only sessions whose transcript changed are re-read, and
+their fields are merged into the existing documents. Anything else stored on a
+document (labels, notes, fields an agent added) is left alone.
+
+The index is <index>-YYYYMMDD-HHMMSS behind the <index> alias. --rebuild writes
+a new one, carries labels and notes over, and swaps the alias when it is done.`)
+  .action(runSync);
+
+program
+  .command('label <session-id> [labels...]')
+  .description('Show or set labels on an indexed session (key=value ...)')
+  .option('--remove <key>', 'Remove a label (repeatable)', collectOption)
+  .option('--message <seq>', 'Label one message, by the position search reports', parseSeq)
+  .option('--source <source>', 'Session source: all, claude, codex, or kimi', parseSource, 'all')
+  .option('--json', 'Output JSON')
+  .addHelpText('after', `
+Labels are free-form classification stored in Elasticsearch. They survive
+every sync and rebuild, and search can filter on them:
+  sessions label a1b2c3d4 client=acme topic=billing,invoices
+  sessions search "refund" --label client=acme
+  sessions label a1b2c3d4 --remove topic`)
+  .action(runLabel);
+
+program
+  .command('labels')
+  .description('List label keys and values with how many sessions carry them')
+  .option('--json', 'Output JSON')
+  .action(runLabels);
 
 program.parse();

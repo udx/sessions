@@ -300,7 +300,9 @@ const baseEnv = {
   TZ: 'UTC',
   SESSIONS_CLAUDE_DIR: claudeDir,
   SESSIONS_CODEX_DIR: codexDir,
-  SESSIONS_KIMI_DIR: kimiDir
+  SESSIONS_KIMI_DIR: kimiDir,
+  // These tests cover the file-scan search, whatever the developer has configured.
+  SESSIONS_SEARCH_BACKEND: 'local'
 };
 
 function invoke(args, env = baseEnv) {
@@ -819,6 +821,57 @@ test('CODEX_HOME works and SESSIONS_CODEX_DIR takes precedence', () => {
   assert.equal(json(['list', '--source', 'codex'], env)[0].sessionId, desktopId);
   env.SESSIONS_CODEX_DIR = path.join(root, 'missing-codex');
   assert.deepEqual(json(['list', '--source', 'codex'], env), []);
+});
+
+console.log('\nClaude prompts typed while the agent was working');
+const queuedDir = path.join(root, 'claude-queued');
+const QUEUED_ID = 'cccccccc-1111-4222-8333-cccccccccccc';
+const queuedCommand = (attachment, offset) => ({
+  type: 'attachment',
+  cwd: '/workspace/queued',
+  timestamp: iso(offset),
+  renderedRole: 'system',
+  attachment: { type: 'queued_command', timestamp: iso(offset), ...attachment }
+});
+writeJsonl(path.join(queuedDir, 'projects', '-workspace-queued', `${QUEUED_ID}.jsonl`), [
+  claudeMessage('user', 'Opening prompt.', -3_000, { cwd: '/workspace/queued' }),
+  claudeMessage('assistant', 'Working on it.', -2_900, { cwd: '/workspace/queued' }),
+  queuedCommand({ commandMode: 'prompt', origin: { kind: 'human' }, prompt: 'Queued midturn needle as a string.' }, -2_800),
+  queuedCommand({ commandMode: 'task-notification', origin: { kind: 'task-notification' }, prompt: '<task-notification>background needle</task-notification>' }, -2_700),
+  queuedCommand({ commandMode: 'prompt', origin: { kind: 'human' }, prompt: [{ type: 'image', source: {} }, { type: 'text', text: 'Queued midturn needle as blocks.' }] }, -2_600),
+  queuedCommand({ commandMode: 'prompt', prompt: 'Queued midturn needle without an origin.' }, -2_500),
+  queuedCommand({ commandMode: 'prompt', origin: { kind: 'human' }, prompt: [{ type: 'image', source: {} }] }, -2_400),
+  { type: 'attachment', timestamp: iso(-2_300), attachment: { type: 'environment', prompt: 'Queued midturn needle that is not a command.' } },
+  claudeMessage('assistant', 'Done.', -2_200, { cwd: '/workspace/queued' })
+]);
+const queuedEnv = { ...baseEnv, SESSIONS_CLAUDE_DIR: queuedDir, SESSIONS_CODEX_DIR: path.join(root, 'none'), SESSIONS_KIMI_DIR: path.join(root, 'none') };
+
+test('queued prompts are read as user messages, in order', () => {
+  const messages = json(['show', QUEUED_ID], queuedEnv);
+  assert.deepEqual(messages.map(m => [m.type, m.message.content.find(block => block.type === 'text').text]), [
+    ['user', 'Opening prompt.'],
+    ['assistant', 'Working on it.'],
+    ['user', 'Queued midturn needle as a string.'],
+    ['user', 'Queued midturn needle as blocks.'],
+    ['user', 'Queued midturn needle without an origin.'],
+    ['assistant', 'Done.']
+  ]);
+  assert.equal(messages[2].queued, true);
+  assert.equal(messages[2].timestamp, iso(-2_800));
+  assert.equal(messages[0].queued, undefined);
+});
+
+test('queued prompts are searchable and counted, notifications are not', () => {
+  const hits = json(['search', 'midturn needle'], queuedEnv);
+  assert.equal(hits.length, 3);
+  assert.equal(hits.every(hit => hit.type === 'user'), true);
+  assert.equal(json(['search', 'background needle'], queuedEnv).length, 0);
+  const [session] = json(['list', '--full'], queuedEnv);
+  assert.equal(session.userCount, 4);
+  assert.equal(session.assistantCount, 2);
+  assert.match(run(['show', QUEUED_ID, '--user-only'], queuedEnv), /Queued midturn needle as blocks\./);
+  assert.match(run(['export', QUEUED_ID, '-f', 'text'], queuedEnv), /\[YOU\][^\n]*\nQueued midturn needle as a string\./);
+  assert.equal(json(['recap', '--days', '1'], queuedEnv)[0].prompts.length, 4);
 });
 
 rmSync(root, { recursive: true, force: true });

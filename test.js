@@ -37,7 +37,8 @@ function testData(name, fn) {
 }
 
 function run(cmd, timeout = 30000) {
-  return execSync(`${CLI} ${cmd}`, { encoding: 'utf8', timeout, env: { ...process.env, NO_COLOR: '1' } });
+  // These tests cover the file-scan search, whatever the developer has configured.
+  return execSync(`${CLI} ${cmd}`, { encoding: 'utf8', timeout, env: { ...process.env, NO_COLOR: '1', SESSIONS_SEARCH_BACKEND: 'local' } });
 }
 
 console.log('\nhelp output');
