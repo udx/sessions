@@ -5,6 +5,9 @@ import path from 'node:path';
 export const DEFAULT_INDEX = 'sessions';
 export const DEFAULT_KEEP = 1;
 export const DEFAULT_AUTO_SYNC_MINUTES = 10;
+// The most transcript, in megabytes, that a search will index on its own
+// before answering. More than that waits for "sessions sync".
+export const DEFAULT_AUTO_SYNC_MAX_MB = 256;
 
 const BACKEND_ALIASES = new Map([
   ['auto', 'auto'],
@@ -54,6 +57,12 @@ function asBoolean(value) {
 function asPositiveInteger(value, fallback) {
   const number = Number(value);
   return Number.isInteger(number) && number >= 1 ? number : fallback;
+}
+
+function asNonNegativeNumber(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : fallback;
 }
 
 // auto_sync: minutes after which a search refreshes the index first.
@@ -145,7 +154,8 @@ export async function loadConfig({ env = process.env, overrides = {} } = {}) {
         asBoolean(env.SESSIONS_ES_ALLOW_REMOTE) ||
         asBoolean(es.allow_remote ?? es.allowRemote),
       keep: asPositiveInteger(overrides.keep ?? es.keep, DEFAULT_KEEP),
-      autoSyncMinutes: asMinutes(env.SESSIONS_ES_AUTO_SYNC ?? es.auto_sync ?? es.autoSync)
+      autoSyncMinutes: asMinutes(env.SESSIONS_ES_AUTO_SYNC ?? es.auto_sync ?? es.autoSync),
+      autoSyncMaxMb: asNonNegativeNumber(env.SESSIONS_ES_AUTO_SYNC_MAX_MB ?? es.auto_sync_max_mb ?? es.autoSyncMaxMb, DEFAULT_AUTO_SYNC_MAX_MB)
     },
     search: {
       // "auto" uses Elasticsearch when a URL is configured and quietly falls

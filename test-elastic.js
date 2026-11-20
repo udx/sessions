@@ -28,6 +28,7 @@ import {
   buildSearchBody,
   collectSessionDocs,
   compareWithIndex,
+  createClient,
   indexDefinition,
   isInjectedUserText,
   mergeHighlights,
@@ -35,6 +36,7 @@ import {
   parseQuery,
   snapshotDate,
   snapshotName,
+  syncIndex,
   toolInputText
 } from './elastic.js';
 
@@ -190,6 +192,8 @@ function createFakeElastic() {
     requests: [],
     failBulkIds: new Set(),
     failRefresh: false,
+    // Bulk requests answered before the cluster "goes away"; null means never.
+    bulkBudget: null,
     searchResponse: null,
     url: null
   };
@@ -315,6 +319,9 @@ function createFakeElastic() {
       return [200, { deleted }];
     }
     if (verb === '_bulk') {
+      if (state.bulkBudget !== null && state.bulkBudget-- <= 0) {
+        return [503, { error: { type: 'unavailable', reason: 'simulated outage' } }];
+      }
       const lines = body.split('\n').filter(Boolean);
       const items = [];
       let errors = false;
@@ -385,6 +392,7 @@ function createFakeElastic() {
       state.requests.length = 0;
       state.failBulkIds.clear();
       state.failRefresh = false;
+      state.bulkBudget = null;
       state.searchResponse = null;
     }
   };
@@ -756,6 +764,40 @@ await test('adjacent highlights inside one identifier are merged', () => {
   assert.equal(mergeHighlights(fragment), `see ${HIGHLIGHT_OPEN}submission-receipt.json${HIGHLIGHT_CLOSE} and ${HIGHLIGHT_OPEN}other${HIGHLIGHT_CLOSE} word`);
 });
 
+await test('a subagent transcript is indexed as a session that names its parent', async () => {
+  const messages = [
+    { type: 'user', timestamp: iso(-300), message: { content: [{ type: 'text', text: 'Check rounding in invoices.' }] } },
+    { type: 'assistant', timestamp: iso(-200), message: { model: 'm1', content: [{ type: 'text', text: 'Totals round half down.' }] } }
+  ];
+  const reader = {
+    streamSessionMessages: async (_session, callback) => { for (const message of messages) callback(message); },
+    extractTextContent: content => content.filter(block => block.type === 'text').map(block => block.text).join('\n'),
+    isDisplayPrompt: () => true
+  };
+  const agent = {
+    sessionId: 'a1111111111111111', shortId: 'a1111111', source: 'claude', project: '/workspace/alpha',
+    filePath: '/tmp/agent.jsonl', size: 9, modifiedAt: new Date(now),
+    subagent: true, parentSessionId: ALPHA_ID, agentType: 'general-purpose', title: 'Billing audit'
+  };
+  const { docs, sessionDoc } = await collectSessionDocs(agent, reader);
+  assert.equal(sessionDoc.doc.subagent, true);
+  assert.equal(sessionDoc.doc.parent_session_id, ALPHA_ID);
+  assert.equal(sessionDoc.doc.agent_type, 'general-purpose');
+  assert.equal(sessionDoc.doc.title, 'Billing audit');
+  // What a subagent was told came from its parent agent, so it is not "you".
+  assert.deepEqual(docs.map(entry => [entry.doc.role, entry.doc.injected, entry.doc.subagent, entry.doc.parent_session_id]),
+    [['user', true, true, ALPHA_ID], ['assistant', false, true, ALPHA_ID]]);
+
+  const { subagent, parentSessionId, agentType, ...ordinary } = agent;
+  const plain = await collectSessionDocs({ ...ordinary, sessionId: BETA_ID }, reader);
+  assert.equal('subagent' in plain.sessionDoc.doc, false);
+  assert.equal('parent_session_id' in plain.docs[0].doc, false);
+  assert.equal(plain.docs[0].doc.injected, false);
+
+  const mapping = indexDefinition().mappings.properties;
+  assert.deepEqual([mapping.subagent.type, mapping.parent_session_id.type, mapping.agent_type.type], ['boolean', 'keyword', 'keyword']);
+});
+
 await test('local sessions are compared with the indexed ones', () => {
   const modifiedAt = new Date(now);
   const local = [
@@ -768,7 +810,7 @@ await test('local sessions are compared with the indexed ones', () => {
     ['claude:grown', { size: 15, modifiedAt: new Date(now - 1000) }],
     ['kimi:gone', { size: 1, modifiedAt }]
   ]);
-  assert.deepEqual(compareWithIndex(local, indexed), { changed: 1, added: 1, missing: 1 });
+  assert.deepEqual(compareWithIndex(local, indexed), { changed: 1, added: 1, missing: 1, bytes: 25 });
 });
 
 await test('labels parse as key=value with optional lists', () => {
@@ -1033,7 +1075,7 @@ await test('sync --status and --drop report on the index', async () => {
   assert.equal(status.index.sessions, TOTAL_SESSIONS);
   assert.equal(status.index.messages, TOTAL_MESSAGES);
   assert.equal(status.index.lastSync.mode, 'create');
-  assert.deepEqual(status.index.pending, { changed: 0, added: 0, missing: 0 });
+  assert.deepEqual(status.index.pending, { changed: 0, added: 0, missing: 0, bytes: 0 });
   const human = await ok(['sync', '--status'], fakeEnv);
   assert.match(human.stdout, /Contents\s+15 messages in 4 sessions/);
   assert.match(human.stdout, /Since sync\s+no local changes/);
@@ -1135,18 +1177,27 @@ await test('--session drills into one indexed session', async () => {
 await test('search falls back to scanning files when Elasticsearch is down', async () => {
   const env = { ...baseEnv, SESSIONS_ES_URL: 'http://127.0.0.1:9' };
   const result = await ok(['search', 'authentication bug'], env);
-  assert.match(result.stderr, /Cannot reach Elasticsearch at http:\/\/127\.0\.0\.1:9 .*Scanning session files instead\./);
-  assert.match(result.stdout, /2 matches \(showing 2\)/);
-  const rows = await json(['search', 'authentication bug'], env);
-  assert.equal(rows.length, 2);
-  assert.equal('matchMode' in rows[0], false);
+  const lines = result.stdout.split('\n');
+  // The reason is part of the results, because stderr is often thrown away.
+  assert.match(lines[0], /^Cannot reach Elasticsearch at http:\/\/127\.0\.0\.1:9 .*Scanning session files instead\.$/);
+  assert.equal(lines[1], '2 matches in 1 session');
+  assert.equal(result.stderr, '');
+  // JSON on stdout stays parseable, so there the reason goes to stderr.
+  const down = await ok(['search', 'authentication bug', '--json'], env);
+  assert.match(down.stderr, /Cannot reach Elasticsearch .*Scanning session files instead\./);
+  const rows = JSON.parse(down.stdout);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].matchesInSession, 2);
+  assert.equal(rows[0].matchMode, 'smart');
+  assert.equal(rows[0].seq, 0);
+  assert.equal('score' in rows[0], false);
 });
 
 await test('search falls back when nothing is indexed yet', async () => {
   fake.reset();
   const result = await ok(['search', 'pickleball'], fakeEnv);
-  assert.match(result.stderr, /has no "sessions" index yet \(run "sessions sync"\)\. Scanning session files instead\./);
-  assert.match(result.stdout, /1 matches \(showing 1\)/);
+  assert.match(result.stdout, /has no "sessions" index yet \(run "sessions sync"\)\. Scanning session files instead\./);
+  assert.match(result.stdout, /^1 match in 1 session$/m);
 });
 
 await test('a forced Elasticsearch backend fails instead of falling back', async () => {
@@ -1163,7 +1214,7 @@ await test('--local and the local backend never contact Elasticsearch', async ()
   fake.reset();
   seedSnapshot(fake.state, 'sessions-20260101-000000', { alias: 'sessions' });
   const flagged = await ok(['search', 'pickleball', '--local'], fakeEnv);
-  assert.match(flagged.stdout, /1 matches \(showing 1\)/);
+  assert.match(flagged.stdout, /^1 match in 1 session$/m);
   await ok(['search', 'pickleball'], { ...fakeEnv, SESSIONS_SEARCH_BACKEND: 'local' });
   assert.equal(fake.state.requests.length, 0);
 });
@@ -1173,46 +1224,72 @@ await test('ELASTICSEARCH_URL alone does not enable the backend', async () => {
   seedSnapshot(fake.state, 'sessions-20260101-000000', { alias: 'sessions' });
   const env = { ...baseEnv, ELASTICSEARCH_URL: fakeUrl };
   const result = await ok(['search', 'pickleball'], env);
-  assert.match(result.stdout, /1 matches \(showing 1\)/);
+  assert.match(result.stdout, /^1 match in 1 session$/m);
   const sync = await cli(['sync'], env);
   assert.equal(sync.status, 1);
   assert.equal(fake.state.requests.length, 0);
 });
 
-await test('Elasticsearch-only options say so without it', async () => {
-  for (const args of [['--tools'], ['--tool', 'Bash'], ['--label', 'a=b'], ['--session', 'aaaaaaaa']]) {
-    const result = await cli(['search', 'git', ...args]);
-    assert.equal(result.status, 1, args.join(' '));
-    assert.match(result.stderr, /use the optional Elasticsearch index\. Run "sessions sync" to set one up\./);
-  }
-  const down = await cli(['search', 'git', '--tool', 'Bash'], { ...baseEnv, SESSIONS_ES_URL: 'http://127.0.0.1:9' });
+await test('labels are the only search option that needs the index', async () => {
+  const unconfigured = await cli(['search', 'git', '--label', 'a=b']);
+  assert.equal(unconfigured.status, 1);
+  assert.match(unconfigured.stderr, /Labels are kept in the optional Elasticsearch index\. Run "sessions sync" to set one up\./);
+  const down = await cli(['search', 'git', '--label', 'a=b'], { ...baseEnv, SESSIONS_ES_URL: 'http://127.0.0.1:9' });
   assert.equal(down.status, 1);
   assert.match(down.stderr, /Cannot reach Elasticsearch/);
   fake.reset();
-  const scanning = await cli(['search', 'git', '--tools', '--local'], fakeEnv);
+  const scanning = await cli(['search', 'git', '--label', 'a=b', '--local'], fakeEnv);
   assert.equal(scanning.status, 1);
   assert.match(scanning.stderr, /this search is set to scan files/);
   assert.equal(fake.state.requests.length, 0);
 });
 
-await test('with nothing configured, nothing changes and nothing mentions Elasticsearch', async () => {
+await test('--tools, --tool and --session work without an index', async () => {
+  // "git commit" was only ever typed into a tool call.
+  const loosened = await json(['search', 'git commit']);
+  assert.equal(loosened.length, 1);
+  assert.equal(loosened[0].matchMode, 'tools');
+  assert.equal(loosened[0].seq, 2);
+  assert.deepEqual(loosened[0].tools, ['Bash']);
+  const human = await ok(['search', 'git commit']);
+  assert.match(human.stdout, /No message text matches; showing tool calls/);
+  const asked = await json(['search', 'git commit', '--tools']);
+  assert.equal(asked[0].matchMode, 'smart');
+  const byTool = await json(['search', 'login', '--tool', 'Bash']);
+  assert.deepEqual(byTool.map(row => row.seq), [2]);
+
+  const drilled = await ok(['search', 'authentication', '--session', 'aaaaaaaa']);
+  const lines = drilled.stdout.trimEnd().split('\n');
+  assert.equal(lines[0], '2 matches in aaaaaaaa [claude] /workspace/alpha');
+  assert.match(lines[1], /^#0 you /);
+  assert.match(lines[3], /^#1 claude /);
+  assert.equal(lines.at(-1), 'Read around a match: sessions show aaaaaaaa --around 0');
+  // The same drill-in keeps working while a configured index is down.
+  const down = await ok(['search', 'authentication', '--session', 'aaaaaaaa'], { ...baseEnv, SESSIONS_ES_URL: 'http://127.0.0.1:9' });
+  assert.match(down.stdout, /^2 matches in aaaaaaaa /m);
+  const missing = await cli(['search', 'x', '--session', 'zzzzzzzz']);
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /Session not found: zzzzzzzz/);
+});
+
+await test('with nothing configured, nothing mentions Elasticsearch and nothing is contacted', async () => {
   fake.reset();
   const plain = await ok(['search', 'pickleball']);
-  assert.match(plain.stdout, /1 matches \(showing 1\)/);
+  assert.match(plain.stdout, /^1 match in 1 session$/m);
   assert.equal(plain.stderr, '');
   // The tool's own Elasticsearch wording; a transcript may well use the word.
-  const backendWording = /Elasticsearch index|sessions sync|Drill in|Scanning session files/;
+  const backendWording = /Elasticsearch index|sessions sync|Scanning session files|Cannot reach/;
   assert.doesNotMatch(plain.stdout, backendWording);
   const scanned = await ok(['search', 'pickleball', '--local']);
   assert.equal(scanned.stdout, plain.stdout);
-  // Options that only shape Elasticsearch results are accepted and ignored.
+  // Options that shape the result do not change a single match.
   const shaped = await ok(['search', 'pickleball', '--sort', 'relevance', '--per-session', '3', '--literal']);
   assert.equal(shaped.stdout, plain.stdout);
   assert.equal(shaped.stderr, '');
   const none = await ok(['search', 'zzz-nothing-says-this']);
   assert.equal(none.stdout, 'No matches for "zzz-nothing-says-this".\n');
   assert.equal(none.stderr, '');
-  for (const args of [['list'], ['projects'], ['show', 'aaaaaaaa'], ['search', 'pickleball', '--json']]) {
+  for (const args of [['list'], ['projects'], ['show', 'aaaaaaaa'], ['search', 'pickleball', '--json'], ['search', 'authentication', '--session', 'aaaaaaaa'], ['search', 'git commit']]) {
     const result = await ok(args);
     assert.equal(result.stderr, '', args.join(' '));
     assert.doesNotMatch(result.stdout, backendWording, args.join(' '));
@@ -1240,8 +1317,10 @@ await test('a config file enables the backend', async () => {
   assert.equal(rows[0].matchMode, 'smart');
   assert.equal(fake.state.requests.some(request => request.path === '/fromfile-20260101-000000/_search'), true);
   writeFileSync(file, `elasticsearch:\n  url: ${fakeUrl}\n  index: fromfile\nsearch:\n  backend: local\n`);
+  const contacted = fake.state.requests.length;
   const local = await json(['search', 'authentication'], env);
-  assert.equal('matchMode' in local[0], false);
+  assert.equal(fake.state.requests.length, contacted);
+  assert.equal('score' in local[0], false);
 });
 
 await test('auto_sync refreshes a stale index before searching', async () => {
@@ -1266,6 +1345,77 @@ await test('auto_sync refreshes a stale index before searching', async () => {
   fake.state.searchResponse = (_body, index) => cannedHit(index);
   await ok(['search', 'authentication'], auto);
   assert.equal(bulkCount(), 0, 'never rebuilds as a side effect of searching');
+});
+
+await test('a search leaves a large backlog to "sessions sync"', async () => {
+  fake.reset();
+  seedSnapshot(fake.state, 'sessions-20260101-000000', { alias: 'sessions' });
+  fake.state.searchResponse = (_body, index) => cannedHit(index);
+  const tight = { ...fakeEnv, SESSIONS_ES_AUTO_SYNC: '5', SESSIONS_ES_AUTO_SYNC_MAX_MB: '0.0001' };
+  const result = await ok(['search', 'authentication'], tight);
+  assert.equal(bulkCount(), 0, 'nothing is indexed as a side effect');
+  assert.match(result.stdout, /^Elasticsearch index synced .*; 4 sessions \(\d+(\.\d+)? (B|KB)\) not indexed yet, run "sessions sync"$/m);
+  // The answer still came from the index.
+  assert.match(result.stdout, /^3 matches in 1 session$/m);
+
+  const file = path.join(root, 'config-budget.yaml');
+  writeFileSync(file, 'elasticsearch:\n  url: http://127.0.0.1:1\n  auto_sync: 5\n  auto_sync_max_mb: 32\n');
+  assert.equal((await loadConfig({ env: { SESSIONS_CONFIG: file } })).elasticsearch.autoSyncMaxMb, 32);
+  assert.equal((await loadConfig({ env: { SESSIONS_CONFIG: file, SESSIONS_ES_AUTO_SYNC_MAX_MB: '8' } })).elasticsearch.autoSyncMaxMb, 8);
+  assert.equal((await loadConfig({ env: { SESSIONS_CONFIG: path.join(root, 'absent-config.yaml') } })).elasticsearch.autoSyncMaxMb, 256);
+  assert.equal((await loadConfig({ env: { SESSIONS_CONFIG: file, SESSIONS_ES_AUTO_SYNC_MAX_MB: 'lots' } })).elasticsearch.autoSyncMaxMb, 256);
+});
+
+await test('an interrupted sync keeps the sessions it finished', async () => {
+  fake.reset();
+  const client = createClient({ url: fakeUrl });
+  const sessions = ['s1', 's2', 's3', 's4', 's5', 's6'].map(id => ({
+    source: 'claude', sessionId: id, shortId: id, project: '/workspace/many', size: 100, modifiedAt: new Date(now)
+  }));
+  const reader = {
+    streamSessionMessages: async (session, callback) => {
+      callback({ type: 'user', timestamp: iso(-100), message: { content: [{ type: 'text', text: `hello from ${session.sessionId}` }] } });
+    },
+    extractTextContent: content => content.filter(block => block.type === 'text').map(block => block.text).join('\n'),
+    isDisplayPrompt: () => true
+  };
+  const everything = sessions.map(session => `claude:${session.sessionId}`);
+  // The first run creates the index, so the next ones update it in place.
+  await syncIndex({ client, alias: 'sessions', sessions: sessions.slice(0, 1), allSessionKeys: everything, reader });
+
+  // Then the cluster goes away part way through a larger run.
+  fake.state.bulkBudget = 5;
+  await assert.rejects(syncIndex({ client, alias: 'sessions', sessions, allSessionKeys: everything, reader, checkpointSessions: 1 }), /returned 503/);
+  fake.state.bulkBudget = null;
+  const [, entry] = fakeIndex();
+  const fingerprinted = [...entry.docs.values()].filter(doc => doc.kind === 'session').map(doc => doc.session_id).sort();
+  assert.deepEqual(fingerprinted, ['s1', 's2', 's3']);
+
+  const resumed = await syncIndex({ client, alias: 'sessions', sessions, allSessionKeys: everything, reader, checkpointSessions: 1 });
+  assert.equal(resumed.unchanged, 3);
+  assert.equal(resumed.sessions, 3);
+  assert.equal([...entry.docs.values()].filter(doc => doc.kind === 'session').length, 6);
+  assert.equal([...entry.docs.values()].filter(doc => doc.kind === 'message').length, 6);
+});
+
+await test('indexed subagent matches say whose they are', async () => {
+  fake.reset();
+  seedSnapshot(fake.state, 'sessions-20260101-000000', { alias: 'sessions' });
+  fake.state.searchResponse = (_body, index) => {
+    const canned = cannedHit(index);
+    Object.assign(canned.hits.hits[0].inner_hits.messages.hits.hits[0]._source, {
+      session_id: 'a1111111111111111', short_id: 'a1111111', role: 'user', injected: true,
+      subagent: true, parent_session_id: ALPHA_ID
+    });
+    return canned;
+  };
+  const human = await ok(['search', 'authentication'], fakeEnv);
+  assert.match(human.stdout, /^a1111111 \[claude\] \/workspace\/alpha \(subagent of aaaaaaaa\) system /m);
+  const [row] = await json(['search', 'authentication'], fakeEnv);
+  assert.equal(row.subagent, true);
+  assert.equal(row.parentSessionId, ALPHA_ID);
+  const body = fake.state.requests.filter(request => request.path.endsWith('/_search')).at(-1).body;
+  assert.equal(body.collapse.inner_hits._source.includes('parent_session_id'), true);
 });
 
 await test('label sets, shows, and removes labels', async () => {
@@ -1361,7 +1511,7 @@ if (!liveUrl) {
       assert.equal(status.index.name, firstIndex);
       assert.equal(status.index.sessions, TOTAL_SESSIONS);
       assert.equal(status.index.messages, TOTAL_MESSAGES);
-      assert.deepEqual(status.index.pending, { changed: 0, added: 0, missing: 0 });
+      assert.deepEqual(status.index.pending, { changed: 0, added: 0, missing: 0, bytes: 0 });
       assert.deepEqual(status.index.labels, []);
       const again = await json(['sync'], liveEnv);
       assert.equal(again.mode, 'update');
@@ -1600,7 +1750,11 @@ if (!liveUrl) {
     await test('an incremental sync updates in place and keeps labels', async () => {
       writeJsonl(alphaPath, [...alphaMessages(), claudeMessage('assistant', 'A freshly written zebracorn answer.', -100, '/workspace/alpha')]);
       assert.equal((await overview(['zebracorn'])).length, 0, 'not searchable until synced');
-      assert.deepEqual((await json(['sync', '--status'], liveEnv)).index.pending, { changed: 1, added: 0, missing: 0 });
+      {
+        const { bytes, ...counts } = (await json(['sync', '--status'], liveEnv)).index.pending;
+        assert.deepEqual(counts, { changed: 1, added: 0, missing: 0 });
+        assert.equal(bytes > 0, true);
+      }
       const summary = await json(['sync'], liveEnv);
       assert.equal(summary.mode, 'update');
       assert.equal(summary.index, firstIndex);
@@ -1647,7 +1801,7 @@ if (!liveUrl) {
       assert.equal(kept.missing, 1);
       assert.equal(kept.pruned, 0);
       assert.equal((await overview(['pickleball'])).length, 1);
-      assert.deepEqual((await json(['sync', '--status'], liveEnv)).index.pending, { changed: 0, added: 0, missing: 1 });
+      assert.deepEqual((await json(['sync', '--status'], liveEnv)).index.pending, { changed: 0, added: 0, missing: 1, bytes: 0 });
       const pruned = await json(['sync', '--prune'], liveEnv);
       assert.equal(pruned.pruned, 1);
       assert.equal((await overview(['pickleball'])).length, 0);
@@ -1676,8 +1830,8 @@ if (!liveUrl) {
       assert.equal(dropped.removed.length, 2);
       assert.deepEqual(await listSnapshots(), []);
       const result = await ok(['search', 'pickleball'], { ...liveEnv, SESSIONS_SEARCH_BACKEND: 'auto' });
-      assert.match(result.stderr, /has no ".*" index yet/);
-      assert.match(result.stdout, /1 matches \(showing 1\)/);
+      assert.match(result.stdout, /has no ".*" index yet .*Scanning session files instead\./);
+      assert.match(result.stdout, /^1 match in 1 session$/m);
     });
   } finally {
     await cli(['sync', '--drop'], liveEnv);

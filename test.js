@@ -1,44 +1,104 @@
 #!/usr/bin/env node
 
+// Command-level checks of the CLI. They run against a few transcripts written
+// to a temporary directory, so the result is the same on every machine.
+
 import assert from 'assert';
 import { execSync } from 'child_process';
-import { existsSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI = `node ${path.join(__dirname, 'index.js')}`;
-const HAS_DATA = existsSync(path.join(os.homedir(), '.claude', 'projects'));
+const root = mkdtempSync(path.join(os.tmpdir(), 'sessions-cli-'));
+const claudeDir = path.join(root, 'claude');
+const now = Date.now();
+
+// --- fixtures ---
+
+function turn(type, content, offset, cwd) {
+  return {
+    type,
+    cwd,
+    timestamp: new Date(now + offset).toISOString(),
+    message: {
+      role: type,
+      model: type === 'assistant' ? 'claude-test' : undefined,
+      content: typeof content === 'string' ? [{ type: 'text', text: content }] : content
+    }
+  };
+}
+
+function writeSession(project, id, turns, ageMs) {
+  const file = path.join(claudeDir, 'projects', project, `${id}.jsonl`);
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, turns.map(record => JSON.stringify(record)).join('\n') + '\n');
+  const date = new Date(now - ageMs);
+  utimesSync(file, date, date);
+}
+
+const SHOP = '/work/shop-api';
+const SITE = '/work/site';
+writeSession('-work-shop-api', 'aaaaaaaa-1111-4222-8333-aaaaaaaaaaaa', [
+  turn('user', 'Please look at the session timeout in the checkout handler.', -9_000, SHOP),
+  turn('assistant', [
+    { type: 'text', text: 'The session timeout comes from the cache layer. Reading the handler.' },
+    { type: 'tool_use', name: 'Read', input: { file_path: '/work/shop-api/checkout.js' } }
+  ], -8_900, SHOP),
+  turn('assistant', [{ type: 'tool_use', name: 'Bash', input: { command: 'npm test' } }], -8_800, SHOP),
+  turn('user', 'Thanks, ship the fix.', -8_700, SHOP),
+  turn('assistant', 'Shipped the fix to the staging cluster.', -8_600, SHOP)
+], 60_000);
+writeSession('-work-shop-api', 'bbbbbbbb-1111-4222-8333-bbbbbbbbbbbb', [
+  turn('user', 'What is the retry policy for the payment webhook?', -7_000, SHOP),
+  turn('assistant', 'The webhook retries three times, then parks the event.', -6_900, SHOP)
+], 3_600_000);
+writeSession('-work-site', 'cccccccc-1111-4222-8333-cccccccccccc', [
+  turn('user', 'Ask claude to rewrite the landing page hero.', -5_000, SITE),
+  turn('assistant', 'Rewrote the hero and the pricing table.', -4_900, SITE)
+], 7_200_000);
+
+writeFileSync(path.join(claudeDir, 'history.jsonl'), [
+  { display: 'Please look at the session timeout in the checkout handler.', timestamp: now - 9_000, project: SHOP, sessionId: 'aaaaaaaa-1111-4222-8333-aaaaaaaaaaaa' },
+  { display: 'Thanks, ship the fix.', timestamp: now - 8_700, project: SHOP, sessionId: 'aaaaaaaa-1111-4222-8333-aaaaaaaaaaaa' },
+  { display: 'Ask claude to rewrite the landing page hero.', timestamp: now - 5_000, project: SITE, sessionId: 'cccccccc-1111-4222-8333-cccccccccccc' }
+].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+
+const cleanEnv = { ...process.env };
+for (const key of Object.keys(cleanEnv)) {
+  if (key.startsWith('SESSIONS_') || key.startsWith('CLAUDE') || key === 'ELASTICSEARCH_URL') delete cleanEnv[key];
+}
+const env = {
+  ...cleanEnv,
+  NO_COLOR: '1',
+  SESSIONS_CLAUDE_DIR: claudeDir,
+  SESSIONS_CODEX_DIR: path.join(root, 'codex'),
+  SESSIONS_KIMI_DIR: path.join(root, 'kimi'),
+  SESSIONS_CONFIG: path.join(root, 'absent.yaml')
+};
 
 let passed = 0;
 let failed = 0;
-let skipped = 0;
 
 function test(name, fn) {
   try {
     fn();
     passed++;
-    console.log(`  \x1b[32m\u2713\x1b[0m ${name}`);
+    console.log(`  \x1b[32m✓\x1b[0m ${name}`);
   } catch (e) {
     failed++;
-    console.log(`  \x1b[31m\u2717\x1b[0m ${name}`);
+    console.log(`  \x1b[31m✗\x1b[0m ${name}`);
     console.log(`    ${e.message}`);
   }
 }
 
-function testData(name, fn) {
-  if (!HAS_DATA) {
-    skipped++;
-    console.log(`  \x1b[33m\u25cb\x1b[0m ${name} (skipped — no session data)`);
-    return;
-  }
-  test(name, fn);
-}
+// These used to need the developer's own transcripts and were skipped without them.
+const testData = test;
 
 function run(cmd, timeout = 30000) {
-  // These tests cover the file-scan search, whatever the developer has configured.
-  return execSync(`${CLI} ${cmd}`, { encoding: 'utf8', timeout, env: { ...process.env, NO_COLOR: '1', SESSIONS_SEARCH_BACKEND: 'local' } });
+  return execSync(`${CLI} ${cmd}`, { encoding: 'utf8', timeout, env, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
 console.log('\nhelp output');
@@ -412,6 +472,6 @@ testData('activity human-readable groups by project', () => {
   assert(out.includes('Activity:'), 'should show activity header');
 });
 
-const skipMsg = skipped > 0 ? `, ${skipped} skipped` : '';
-console.log(`\n\x1b[${failed ? '31' : '32'}m${passed} passed, ${failed} failed${skipMsg}\x1b[0m\n`);
+rmSync(root, { recursive: true, force: true });
+console.log(`\n\x1b[${failed ? '31' : '32'}m${passed} passed, ${failed} failed\x1b[0m\n`);
 process.exit(failed > 0 ? 1 : 0);

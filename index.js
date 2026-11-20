@@ -5,11 +5,13 @@ import chalk from 'chalk';
 import fs from 'fs/promises';
 import path from 'path';
 import { createReadStream, existsSync } from 'fs';
-import { createInterface } from 'readline';
 import { createHash } from 'crypto';
+import { spawn, spawnSync } from 'child_process';
+import zlib from 'zlib';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import { displayUrl, isLoopbackUrl, isValidIndexName, loadConfig } from './config.js';
+import { HIGHLIGHT_OPEN, HIGHLIGHT_CLOSE } from './query.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(await fs.readFile(path.join(__dirname, 'package.json'), 'utf8'));
@@ -143,22 +145,183 @@ function wrapText(text, width, indent = 2) {
   return wrapped.join('\n');
 }
 
-async function streamLines(filePath, callback) {
-  const stream = createReadStream(filePath);
-  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+// Codex compresses a finished rollout to .jsonl.zst. Node reads Zstandard on
+// its own from 22.15; before that the zstd command does it, when installed.
+// SESSIONS_ZSTD_READER (zlib, command, or none) pins the choice for tests.
+let zstdReader;
+function zstdSupport() {
+  if (zstdReader !== undefined) return zstdReader;
+  const forced = String(process.env.SESSIONS_ZSTD_READER || '').toLowerCase();
+  const builtIn = typeof zlib.createZstdDecompress === 'function';
+  if (forced === 'none') zstdReader = null;
+  else if (builtIn && forced !== 'command') zstdReader = 'zlib';
+  else zstdReader = spawnSync('zstd', ['--version'], { stdio: 'ignore' }).status === 0 ? 'command' : null;
+  return zstdReader;
+}
+
+const ZSTD_REQUIREMENT = 'reading .jsonl.zst needs Node 22.15 or newer, or the zstd command';
+
+// Opens a transcript as a stream of bytes, decompressing when it has to.
+function openTranscript(filePath) {
+  if (!filePath.endsWith('.zst')) {
+    const stream = createReadStream(filePath);
+    return { input: stream, dispose: () => stream.destroy() };
+  }
+  const reader = zstdSupport();
+  if (reader === 'zlib') {
+    const source = createReadStream(filePath, { highWaterMark: 1 << 20 });
+    const decoder = zlib.createZstdDecompress({ chunkSize: 1 << 20 });
+    source.on('error', error => decoder.destroy(error));
+    source.pipe(decoder);
+    return { input: decoder, dispose: () => { source.destroy(); decoder.destroy(); } };
+  }
+  if (reader === 'command') {
+    const child = spawn('zstd', ['-dc', '--', filePath], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let complaint = '';
+    child.stderr.setEncoding('utf8').on('data', (chunk) => { if (complaint.length < 2000) complaint += chunk; });
+    child.on('error', error => child.stdout.destroy(error));
+    const exited = new Promise(resolve => child.on('close', resolve));
+    return {
+      input: child.stdout,
+      dispose: () => { child.stdout.destroy(); child.kill(); },
+      // The command's output just ends when the archive is damaged, so its
+      // exit status is what says the file was not read to the end.
+      problem: async () => {
+        const code = await exited;
+        if (code === 0) return null;
+        const said = complaint.trim().split('\n').pop().replace(/^zstd: /, '').replace(`${filePath}: `, '');
+        return new Error(said || `zstd exited with status ${code}`);
+      }
+    };
+  }
+  throw new Error(ZSTD_REQUIREMENT);
+}
+
+const LINE_HEAD_BYTES = 160;
+
+// The first bytes of a line that is still being collected, as text.
+function lineHead(parts) {
+  if (parts.length === 1) return parts[0].toString('latin1', 0, LINE_HEAD_BYTES);
+  let head = '';
+  for (const part of parts) {
+    head += part.toString('latin1', 0, LINE_HEAD_BYTES - head.length);
+    if (head.length >= LINE_HEAD_BYTES) break;
+  }
+  return head;
+}
+
+// Yields the lines of a JSONL byte stream as strings.
+//
+// Lines end at "\n" and nowhere else. readline also breaks on U+2028 and
+// U+2029, which a JSON string may contain as they are, and so loses every
+// record that holds one.
+//
+// isUnused, when given, sees the first bytes of each line and returns true
+// for a line that is not worth reading. Such a line is never turned into a
+// string, which matters when most of a file is multi-megabyte tool output.
+async function* jsonLines(input, isUnused = null) {
+  let parts = [];
+  let length = 0;
+  let judged = isUnused === null;
+  let skipping = false;
+
+  for await (const chunk of input) {
+    let offset = 0;
+    while (offset < chunk.length) {
+      const newline = chunk.indexOf(10, offset);
+      const end = newline === -1 ? chunk.length : newline;
+      if (!skipping) {
+        if (end > offset) {
+          parts.push(chunk.subarray(offset, end));
+          length += end - offset;
+        }
+        if (!judged && (length >= LINE_HEAD_BYTES || newline !== -1)) {
+          judged = true;
+          if (length > 0 && isUnused(lineHead(parts))) skipping = true;
+        }
+      }
+      if (newline === -1) break;
+      if (!skipping && length > 0) {
+        yield (parts.length === 1 ? parts[0] : Buffer.concat(parts, length)).toString('utf8');
+      }
+      parts = [];
+      length = 0;
+      judged = isUnused === null;
+      skipping = false;
+      offset = newline + 1;
+    }
+    if (skipping && parts.length > 0) {
+      parts = [];
+      length = 0;
+    }
+  }
+  if (!skipping && length > 0) {
+    yield (parts.length === 1 ? parts[0] : Buffer.concat(parts, length)).toString('utf8');
+  }
+}
+
+const unreadableWarned = new Set();
+
+// Reads a JSONL transcript record by record until the callback returns true.
+// A stream that fails part way (a damaged archive, a file removed mid-read)
+// ends the read there: what came before it is kept, and the file is named
+// once on stderr, so one bad transcript never stops a command.
+async function streamLines(filePath, callback, isUnused = null) {
+  let opened;
   try {
-    for await (const line of rl) {
+    opened = openTranscript(filePath);
+  } catch (error) {
+    warnUnreadable(filePath, error);
+    return;
+  }
+  let stopped = false;
+  try {
+    for await (const line of jsonLines(opened.input, isUnused)) {
       if (!line.trim()) continue;
       try {
         const data = JSON.parse(line);
         const stop = callback(data);
-        if (stop === true) break;
+        if (stop === true) {
+          stopped = true;
+          break;
+        }
       } catch {}
     }
+    // Stopping early leaves the rest unread on purpose; only a read that ran
+    // to the end can have been cut short.
+    const problem = !stopped && opened.problem ? await opened.problem() : null;
+    if (problem) warnUnreadable(filePath, problem);
+  } catch (error) {
+    warnUnreadable(filePath, error);
   } finally {
-    rl.close();
-    stream.destroy();
+    opened.dispose();
   }
+}
+
+function warnUnreadable(filePath, error) {
+  if (unreadableWarned.has(filePath)) return;
+  unreadableWarned.add(filePath);
+  console.error(c.yellow(`Could not read all of ${filePath}: ${error.message}`));
+}
+
+// Most of a Codex rollout is tool output, screenshots and bookkeeping that
+// never becomes a message, and parsing it is where reading one spends its
+// time. Such a record is recognized from the start of its line and skipped
+// unparsed. A line that does not start the expected way is parsed as before.
+const CODEX_LINE_HEAD = /^\{"timestamp":"[^"]*",(?:"ordinal":\d+,)?"type":"([a-z_]+)"(?:,"payload":\{"type":"([a-z_]+)")?/;
+const CODEX_UNUSED_RECORDS = new Set(['compacted', 'token_usage_record', 'world_state', 'inter_agent_communication_metadata']);
+const CODEX_USED_ITEMS = new Set(['message', 'function_call', 'custom_tool_call']);
+const CODEX_USED_EVENTS = new Set(['user_message', 'agent_message']);
+
+function isUnusedCodexLine(lineStart) {
+  const head = CODEX_LINE_HEAD.exec(lineStart);
+  if (!head) return false;
+  const [, type, inner] = head;
+  if (CODEX_UNUSED_RECORDS.has(type)) return true;
+  if (!inner) return false;
+  if (type === 'response_item') return !CODEX_USED_ITEMS.has(inner);
+  if (type === 'event_msg') return !CODEX_USED_EVENTS.has(inner);
+  return false;
 }
 
 async function resolveClaudeProjectPath(encodedDir) {
@@ -213,9 +376,58 @@ function makeShortId(source, sessionId) {
   return source === 'codex' ? compact.slice(0, 12) : compact.slice(0, 8);
 }
 
-async function getClaudeSessionFiles(projectFilter = null) {
+// Subagent transcripts sit beside the session that spawned them:
+//   <project>/<session-id>/subagents/agent-<id>.jsonl
+//   <project>/<session-id>/subagents/workflows/<workflow-id>/agent-<id>.jsonl
+// each with an optional agent-<id>.meta.json naming its type and its task.
+// They are searchable and can be shown, but stay out of session listings.
+async function getClaudeSubagentFiles(projectDir, project) {
+  const found = [];
+  const entries = await fs.readdir(projectDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const pending = [path.join(projectDir, entry.name, 'subagents')];
+    while (pending.length > 0) {
+      const dir = pending.pop();
+      const items = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+      for (const item of items) {
+        const fullPath = path.join(dir, item.name);
+        if (item.isDirectory()) {
+          pending.push(fullPath);
+          continue;
+        }
+        const match = item.isFile() ? item.name.match(/^agent-([A-Za-z0-9_-]+)\.jsonl$/) : null;
+        if (!match) continue;
+        const stat = await fs.stat(fullPath).catch(() => null);
+        if (!stat) continue;
+        let meta = {};
+        try {
+          meta = JSON.parse(await fs.readFile(fullPath.replace(/\.jsonl$/, '.meta.json'), 'utf8')) || {};
+        } catch {}
+        found.push({
+          sessionId: match[1],
+          shortId: makeShortId('claude', match[1]),
+          source: 'claude',
+          project: project.path,
+          projectEncoded: project.encoded,
+          filePath: fullPath,
+          size: stat.size,
+          modifiedAt: stat.mtime,
+          subagent: true,
+          parentSessionId: entry.name,
+          agentType: typeof meta.agentType === 'string' ? meta.agentType : null,
+          title: typeof meta.description === 'string' && meta.description.trim() ? meta.description.trim() : null
+        });
+      }
+    }
+  }
+  return found;
+}
+
+async function getClaudeSessionFiles(projectFilter = null, { subagents = false } = {}) {
   const projects = await getClaudeProjects();
   const sessions = [];
+  const agents = new Map();
 
   for (const project of projects) {
     if (projectFilter) {
@@ -246,9 +458,18 @@ async function getClaudeSessionFiles(projectFilter = null) {
         modifiedAt: stat.mtime
       });
     }
+
+    if (subagents) {
+      // A resumed session can carry a copy of a subagent's transcript; the
+      // newer copy stands for the agent.
+      for (const agent of await getClaudeSubagentFiles(projectDir, project)) {
+        const existing = agents.get(agent.sessionId);
+        if (!existing || agent.modifiedAt > existing.modifiedAt) agents.set(agent.sessionId, agent);
+      }
+    }
   }
 
-  return sessions.sort((a, b) => b.modifiedAt - a.modifiedAt);
+  return [...sessions, ...agents.values()].sort((a, b) => b.modifiedAt - a.modifiedAt);
 }
 
 async function findJsonlFiles(rootDir) {
@@ -262,7 +483,7 @@ async function findJsonlFiles(rootDir) {
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) pending.push(fullPath);
-      else if (entry.isFile() && entry.name.endsWith('.jsonl')) files.push(fullPath);
+      else if (entry.isFile() && /\.jsonl(\.zst)?$/.test(entry.name)) files.push(fullPath);
     }
   }
 
@@ -270,9 +491,12 @@ async function findJsonlFiles(rootDir) {
 }
 
 function sessionIdFromCodexFilename(filePath) {
-  const match = path.basename(filePath).match(/([0-9a-f]{8}-[0-9a-f-]{27,})\.jsonl$/i);
-  return match ? match[1] : path.basename(filePath, '.jsonl').replace(/^rollout-[^-]+-/, '');
+  const base = path.basename(filePath).replace(/\.zst$/, '');
+  const match = base.match(/([0-9a-f]{8}-[0-9a-f-]{27,})\.jsonl$/i);
+  return match ? match[1] : base.replace(/\.jsonl$/, '').replace(/^rollout-[^-]+-/, '');
 }
+
+const CODEX_HEADER_LINES = 400;
 
 async function getCodexSessionDescriptor(filePath, archived = false) {
   const stat = await fs.stat(filePath).catch(() => null);
@@ -282,19 +506,27 @@ async function getCodexSessionDescriptor(filePath, archived = false) {
   let sessionId = null;
   let project = null;
   let startedAt = null;
+  let lines = 0;
+  // The metadata sits at the top of a rollout. A fork starts with its
+  // parent's record, sometimes followed by its own; when its own never
+  // comes, the first turn says where it ran. Reading stops there, because
+  // this runs for every rollout on every command.
   await streamLines(filePath, (data) => {
-    if (data.type === 'session_meta' && data.payload) {
-      const candidateId = data.payload.id || data.payload.session_id;
-      const isCanonical = candidateId && filenameSessionId && candidateId === filenameSessionId;
-      if (!sessionId || isCanonical) {
-        sessionId = candidateId || sessionId;
+      lines++;
+      if (data.type === 'session_meta' && data.payload) {
+        const candidateId = data.payload.id || data.payload.session_id;
+        const isCanonical = candidateId && filenameSessionId && candidateId === filenameSessionId;
+        if (!sessionId || isCanonical) {
+          sessionId = candidateId || sessionId;
+          project = data.payload.cwd || project;
+          startedAt = data.payload.timestamp || data.timestamp || startedAt;
+        }
+        if (isCanonical && project) return true;
+      } else if (data.type === 'turn_context' && data.payload) {
         project = data.payload.cwd || project;
-        startedAt = data.payload.timestamp || data.timestamp || startedAt;
+        if (sessionId && project) return true;
       }
-      if (isCanonical && project) return true;
-    } else if (data.type === 'turn_context' && data.payload) {
-      project = data.payload.cwd || project;
-    }
+      if (lines >= CODEX_HEADER_LINES && sessionId) return true;
   });
 
   sessionId = filenameSessionId || sessionId;
@@ -315,9 +547,23 @@ async function getCodexSessionDescriptor(filePath, archived = false) {
   };
 }
 
+let compressedSkipWarned = false;
+
+// Drops compressed rollouts this Node cannot read, and says so once.
+function readableRollouts(files) {
+  if (zstdSupport()) return files;
+  const readable = files.filter(file => !file.endsWith('.zst'));
+  const skipped = files.length - readable.length;
+  if (skipped > 0 && !compressedSkipWarned) {
+    compressedSkipWarned = true;
+    console.error(c.yellow(`${plural(skipped, 'compressed Codex session')} skipped: ${ZSTD_REQUIREMENT}.`));
+  }
+  return readable;
+}
+
 async function getCodexSessionFiles(projectFilter = null) {
-  const activeFiles = await findJsonlFiles(CODEX_SESSIONS_DIR);
-  const archivedFiles = await findJsonlFiles(CODEX_ARCHIVED_SESSIONS_DIR);
+  const activeFiles = readableRollouts(await findJsonlFiles(CODEX_SESSIONS_DIR));
+  const archivedFiles = readableRollouts(await findJsonlFiles(CODEX_ARCHIVED_SESSIONS_DIR));
   const descriptors = [];
   for (const file of activeFiles) descriptors.push(await getCodexSessionDescriptor(file, false));
   for (const file of archivedFiles) descriptors.push(await getCodexSessionDescriptor(file, true));
@@ -596,11 +842,13 @@ async function getKimiHistoryWorkDirMap() {
 }
 
 
-async function getSessionFiles(projectFilter = null, source = 'all') {
+// subagents: also return Claude subagent transcripts, which search, show,
+// export, label and sync read, and listings leave out.
+async function getSessionFiles(projectFilter = null, source = 'all', { subagents = false } = {}) {
   const selected = parseSource(source);
   const include = (name) => selected === 'all' || selected === name;
   const groups = await Promise.all([
-    include('claude') ? getClaudeSessionFiles(projectFilter) : [],
+    include('claude') ? getClaudeSessionFiles(projectFilter, { subagents }) : [],
     include('codex') ? getCodexSessionFiles(projectFilter) : [],
     include('kimi') ? getKimiSessionFiles(projectFilter) : []
   ]);
@@ -808,7 +1056,7 @@ async function streamSessionMessages(session, callback) {
       if (pending && emit(pending)) return true;
       pending = message;
     }
-  });
+  }, isUnusedCodexLine);
   if (!stopped && pending) emit(pending);
 }
 
@@ -984,6 +1232,8 @@ function findSessions(sessions, rawIdFragment) {
     source = qualified[1].toLowerCase();
     idFragment = qualified[2];
   }
+  // Kimi names its session folders session_<id>, and that is the form people paste.
+  idFragment = idFragment.replace(/^session_/, '');
   const candidates = source ? sessions.filter(s => s.source === source) : sessions;
   const exact = candidates.filter(s => s.sessionId === idFragment || s.shortId === idFragment);
   if (exact.length > 0) return exact;
@@ -1009,7 +1259,7 @@ function formatMessageBlock(msg, opts = {}) {
   if (msg.type === 'user') {
     const text = extractTextContent(msg.message?.content);
     if (!text || !text.trim()) return null;
-    const header = c.bold.cyan('\u25b6 You') + c.dim(` ${ts}`) + (opts.tag || '');
+    const header = c.bold.cyan(`\u25b6 ${opts.userLabel || 'You'}`) + c.dim(` ${ts}`) + (opts.tag || '');
     return header + '\n' + wrapText(text, termWidth);
   }
 
@@ -1131,6 +1381,21 @@ function speakerTag(r) {
   return r.type === 'user' ? c.cyan('you') : c.green(r.source);
 }
 
+// How a subagent transcript is marked wherever a session is named.
+function subagentNote(parentSessionId) {
+  return `(subagent of ${makeShortId('claude', parentSessionId || '')})`;
+}
+
+// Header lines that say what a subagent transcript is and how to reach the
+// session it worked for. Empty for an ordinary session.
+function subagentHeader(session) {
+  if (!session.subagent) return [];
+  const kind = [session.agentType, session.title].filter(Boolean).join(': ');
+  return [
+    `Subagent of: ${session.parentSessionId}${kind ? ` (${kind})` : ''}`
+  ];
+}
+
 function printSearchMatch(r, totalInSession) {
   const time = r.timestamp ? formatRelativeTime(r.timestamp) : '';
   const who = speakerTag(r);
@@ -1141,6 +1406,7 @@ function printSearchMatch(r, totalInSession) {
     c.yellow(r.shortId) + ' ' +
     sourceTag(r.source) + ' ' +
     c.dim(r.project) + ' ' +
+    (r.subagent ? c.dim(`${subagentNote(r.parentSessionId)} `) : '') +
     who + ' ' +
     c.dim(time) +
     position +
@@ -1185,21 +1451,6 @@ function paintFragment(fragment, open, close) {
     .join('');
 }
 
-function elasticSnippets(hit, query, mode, elastic) {
-  if (mode === 'literal') {
-    const literal = hit.text ? literalSnippets(hit.text, query).slice(0, 2) : [];
-    if (literal.length > 0) return literal;
-  }
-  const paint = fragment => paintFragment(fragment, elastic.HIGHLIGHT_OPEN, elastic.HIGHLIGHT_CLOSE);
-  const snippets = hit.fragments.slice(0, 2).map(paint);
-  if (hit.toolFragments.length > 0) {
-    const label = hit.tools.length > 0 ? hit.tools.join(', ') : 'tool';
-    snippets.push(c.dim(`\u{1f527} ${label}: `) + paint(hit.toolFragments[0]));
-  }
-  if (snippets.length === 0 && hit.preview) snippets.push(hit.preview);
-  return snippets;
-}
-
 function describeScope(scope = {}) {
   const parts = [];
   if (scope.source && scope.source !== 'all') parts.push(`${scope.source} only`);
@@ -1212,7 +1463,10 @@ function describeScope(scope = {}) {
 function snapshotFooter(snapshot) {
   const synced = snapshot.syncedAt ? formatRelativeTime(snapshot.syncedAt) : 'at an unknown time';
   const ageMs = snapshot.syncedAt ? Date.now() - snapshot.syncedAt.getTime() : Infinity;
-  const hint = ageMs > 60 * 60_000 ? '; run "sessions sync" to include newer messages' : '';
+  let hint = ageMs > 60 * 60_000 ? '; run "sessions sync" to include newer messages' : '';
+  if (snapshot.backlog) {
+    hint = `; ${plural(snapshot.backlog.sessions, 'session')} (${formatSize(snapshot.backlog.bytes)}) not indexed yet, run "sessions sync"`;
+  }
   return `Elasticsearch index synced ${synced}${hint}`;
 }
 
@@ -1238,7 +1492,9 @@ const SEARCH_MODE_NOTES = {
 
 // With auto_sync set, a search first brings the index up to date when its
 // last sync is older than that many minutes. Only changed transcripts are
-// re-read, so this usually takes a second or two.
+// re-read, so this usually takes a second or two. When there is more to read
+// than auto_sync_max_mb, the search answers from the index as it is and says
+// what is waiting, because whoever is searching is waiting too.
 async function refreshIfStale(elastic, client, config, snapshot) {
   const es = config.elasticsearch;
   if (!es.autoSyncMinutes || !snapshot.syncedAt) return snapshot;
@@ -1246,7 +1502,11 @@ async function refreshIfStale(elastic, client, config, snapshot) {
   if (snapshot.meta?.schema !== elastic.SCHEMA_VERSION) return snapshot;
   if (!isLoopbackUrl(es.url) && !es.allowRemote) return snapshot;
   try {
-    const everything = await getSessionFiles(null, 'all');
+    const everything = await getSessionFiles(null, 'all', { subagents: true });
+    const waiting = elastic.compareWithIndex(everything, await elastic.indexedSessions(client, snapshot.index));
+    if (waiting.bytes > es.autoSyncMaxMb * 1024 * 1024) {
+      return { ...snapshot, backlog: { sessions: waiting.changed + waiting.added, bytes: waiting.bytes } };
+    }
     await elastic.syncIndex({
       client,
       alias: es.index,
@@ -1281,8 +1541,40 @@ function printFacets(facets) {
   line('Sources:', facets.sources);
 }
 
-// Returns true when the search was answered, or a reason it could not be.
-async function runElasticSearch(query, opts, config) {
+// --- search: two backends, one presenter ---
+//
+// Both backends answer the same query language and return the same outcome:
+//   backend    'elasticsearch' or 'files'
+//   mode       how the query was matched (see SEARCH_MODE_NOTES)
+//   rows       the matches to show, best session first
+//   totals     { messages, sessions } across everything that was searched
+//   inSession  set when --session narrowed the search to one session
+//   partial    files only: { scanned, available } when the scan stopped early
+//   facets     Elasticsearch only: where and when the matches are
+//   prompts    Map(session key -> first prompts), for --preview
+//   notice     a first line saying why the index was not used, if it was not
+//   footer     a closing line, such as how fresh the index is
+
+// The lines shown under one match: highlighted stretches of the message, then
+// of its tool calls, or the start of the message when nothing is highlighted.
+function hitSnippets(hit, query, mode) {
+  if (mode === 'literal' && hit.text) {
+    const literal = literalSnippets(hit.text, query).slice(0, 2);
+    if (literal.length > 0) return literal;
+  }
+  const paint = fragment => paintFragment(fragment, HIGHLIGHT_OPEN, HIGHLIGHT_CLOSE);
+  const snippets = hit.fragments.slice(0, 2).map(paint);
+  if (hit.toolFragments.length > 0) {
+    const label = hit.tools.length > 0 ? hit.tools.join(', ') : 'tool';
+    snippets.push(c.dim(`\u{1f527} ${label}: `) + paint(hit.toolFragments[0]));
+  }
+  if (snippets.length === 0 && hit.preview) snippets.push(hit.preview);
+  return snippets;
+}
+
+// Answers a search from the Elasticsearch index. Returns the outcome, or a
+// sentence saying why the index could not answer.
+async function searchElastic(query, opts, config) {
   const elastic = await import('./elastic.js');
   const es = config.elasticsearch;
   const client = elastic.createClient({ ...es, timeoutMs: 20_000 });
@@ -1330,13 +1622,14 @@ async function runElasticSearch(query, opts, config) {
     }
   });
 
-  // -n caps the matches shown, as it does when scanning files. Sessions come
-  // best first and each contributes up to --per-session matches.
+  // -n caps the matches shown. Sessions come best first and each contributes
+  // up to --per-session matches.
   const hits = result.groups.flatMap(group => group.hits.map(hit => ({ hit, group }))).slice(0, limit);
-  const shownSessions = new Set(hits.map(({ hit }) => hit.sessionKey));
-  const [context, sessionLabels] = await Promise.all([
+  const shownSessions = [...new Set(hits.map(({ hit }) => hit.sessionKey))];
+  const [context, sessionLabels, prompts] = await Promise.all([
     elastic.fetchContext(client, snapshot.index, hits.map(({ hit }) => hit), contextN),
-    elastic.getLabels(client, snapshot.index, [...shownSessions])
+    elastic.getLabels(client, snapshot.index, shownSessions),
+    opts.preview && !opts.json ? elastic.fetchPrompts(client, snapshot.index, shownSessions) : new Map()
   ]);
   const rows = hits.map(({ hit, group }) => {
     const row = {
@@ -1347,7 +1640,7 @@ async function runElasticSearch(query, opts, config) {
       timestamp: hit.timestamp,
       type: hit.role,
       model: hit.model || undefined,
-      snippets: elasticSnippets(hit, query, result.mode, elastic),
+      snippets: hitSnippets(hit, query, result.mode),
       contextMessages: (context.get(`${hit.sessionKey}:${hit.seq}`) || []).map(message => ({ ...message, text: truncate(message.text, 150) })),
       score: hit.score,
       matchesInSession: group.matchesInSession,
@@ -1357,6 +1650,10 @@ async function runElasticSearch(query, opts, config) {
       _sessionKey: hit.sessionKey
     };
     if (hit.injected) row.injected = true;
+    if (hit.subagent) {
+      row.subagent = true;
+      row.parentSessionId = hit.parentSessionId;
+    }
     // Label fields appear only when something is labeled.
     const ofSession = sessionLabels.get(hit.sessionKey);
     if (ofSession) row.sessionLabels = ofSession;
@@ -1364,32 +1661,188 @@ async function runElasticSearch(query, opts, config) {
     return row;
   });
 
-  if (opts.json) {
-    console.log(JSON.stringify(rows.map(({ _sessionKey, ...rest }) => rest), null, 2));
-    return true;
+  return {
+    backend: 'elasticsearch',
+    mode: result.mode,
+    rows,
+    totals: { messages: result.totalMessages, sessions: result.totalSessions },
+    inSession: inSession ? { shortId: inSession.shortId, source: inSession.source, project: inSession.project } : null,
+    partial: null,
+    facets: result.facets,
+    prompts,
+    notice: null,
+    footer: snapshotFooter(snapshot)
+  };
+}
+
+async function firstPrompts(session, count = 5) {
+  const prompts = [];
+  await streamSessionMessages(session, (data) => {
+    if (data.type !== 'user') return;
+    const text = extractTextContent(data.message?.content);
+    if (!text || !text.trim()) return;
+    prompts.push({ text, timestamp: data.timestamp || null });
+    if (prompts.length >= count) return true;
+  });
+  return prompts;
+}
+
+// Answers a search by reading the session files, newest session first.
+async function searchLocal(query, opts) {
+  const { searchFiles } = await import('./local-search.js');
+  const limit = parseInt(opts.limit);
+  let sessions = await getSessionFiles(opts.project, opts.source, { subagents: true });
+  const since = sinceFromOptions(opts);
+  if (since) sessions = sessions.filter(s => s.modifiedAt >= since);
+
+  let inSession = null;
+  if (opts.session) {
+    try {
+      inSession = resolveSession(await getSessionFiles(null, opts.source, { subagents: true }), opts.session);
+    } catch (error) {
+      failWith(error.message);
+    }
+    if (!inSession) failWith(`Session not found: ${opts.session}`);
+    const wanted = sessionKey(inSession);
+    sessions = sessions.filter(s => sessionKey(s) === wanted);
   }
 
+  const result = await searchFiles({
+    query,
+    sessions,
+    reader: { streamSessionMessages, extractTextContent },
+    limit,
+    perSession: opts.perSession || 1,
+    context: parseInt(opts.context),
+    literal: Boolean(opts.literal),
+    includeTools: Boolean(opts.tools),
+    tool: opts.tool || null,
+    role: opts.role || null,
+    sort: opts.sort || 'relevance',
+    inSession: Boolean(inSession)
+  });
+
+  const picked = result.groups.flatMap(group => group.hits.map(hit => ({ hit, group }))).slice(0, limit);
+  const rows = picked.map(({ hit, group }) => {
+    const { session } = group;
+    const nearby = (position) => (message) => ({ type: message.type, text: truncate(message.text, 150), position });
+    const row = {
+      sessionId: session.sessionId,
+      shortId: session.shortId,
+      source: session.source,
+      project: session.project,
+      timestamp: hit.timestamp,
+      type: hit.role,
+      model: hit.model || undefined,
+      snippets: hitSnippets(hit, query, result.mode),
+      contextMessages: [...hit.before.map(nearby('before')), ...hit.after.map(nearby('after'))],
+      matchesInSession: group.matchesInSession,
+      matchMode: result.mode,
+      seq: hit.seq,
+      tools: hit.tools,
+      _sessionKey: sessionKey(session)
+    };
+    if (hit.injected) row.injected = true;
+    if (session.subagent) {
+      row.subagent = true;
+      row.parentSessionId = session.parentSessionId;
+    }
+    return row;
+  });
+
+  const prompts = new Map();
+  if (opts.preview && !opts.json) {
+    const shown = new Map(picked.map(({ group }) => [sessionKey(group.session), group.session]));
+    for (const [key, session] of shown) prompts.set(key, await firstPrompts(session));
+  }
+
+  return {
+    backend: 'files',
+    mode: result.mode,
+    rows,
+    totals: { messages: result.totalMessages, sessions: result.totalSessions },
+    inSession: inSession ? { shortId: inSession.shortId, source: inSession.source, project: inSession.project } : null,
+    partial: result.complete ? null : { scanned: result.scanned, available: result.available },
+    facets: null,
+    prompts,
+    notice: null,
+    footer: null
+  };
+}
+
+// Picks the backend for a search and returns its outcome. The index answers
+// when one is configured and reachable; otherwise the session files do, and
+// the outcome says why. Only labels have no file-scan equivalent.
+async function runSearch(query, opts) {
+  const config = await loadConfig({ overrides: { backend: opts.local ? 'local' : undefined } });
+  if (config.warning) console.error(c.yellow(config.warning));
+  const es = config.elasticsearch;
+  const backend = config.search.backend;
+  const wantsLabels = Boolean(opts.label?.length);
+  const useElastic = backend === 'elasticsearch' || (backend === 'auto' && Boolean(es.url));
+
+  if (!useElastic) {
+    if (wantsLabels) {
+      failWith(es.url
+        ? '--label needs the Elasticsearch index, and this search is set to scan files (--local or search.backend: local).'
+        : 'Labels are kept in the optional Elasticsearch index. Run "sessions sync" to set one up.');
+    }
+    return searchLocal(query, opts);
+  }
+
+  let failure;
+  if (!es.url) {
+    failure = 'No Elasticsearch URL is configured (set SESSIONS_ES_URL or elasticsearch.url in ~/.sessions/config.yaml)';
+  } else {
+    try {
+      const outcome = await searchElastic(query, opts, config);
+      if (typeof outcome !== 'string') return outcome;
+      failure = outcome;
+    } catch (error) {
+      if (error.name !== 'ElasticError') throw error;
+      failure = error.message;
+    }
+  }
+  if (backend === 'elasticsearch' || wantsLabels) failWith(failure);
+
+  const outcome = await searchLocal(query, opts);
+  outcome.notice = `${failure}. Scanning session files instead.`;
+  return outcome;
+}
+
+function printSearchOutcome(query, opts, outcome) {
+  const { rows, inSession, totals } = outcome;
+  if (opts.json) {
+    // JSON on stdout has to stay parseable, so the notice goes to stderr.
+    if (outcome.notice) console.error(c.dim(outcome.notice));
+    console.log(JSON.stringify(rows.map(({ _sessionKey, ...rest }) => rest), null, 2));
+    return;
+  }
+
+  // In the results themselves, where whoever reads them will see it.
+  if (outcome.notice) console.log(c.dim(outcome.notice));
   if (rows.length === 0) {
     console.log(inSession ? `No matches for "${query}" in ${inSession.shortId}.` : `No matches for "${query}".`);
-    console.log(c.dim(snapshotFooter(snapshot)));
-    return true;
+    if (outcome.footer) console.log(c.dim(outcome.footer));
+    return;
   }
 
+  const shownSessions = new Set(rows.map(row => row._sessionKey));
   if (inSession) {
-    const shown = rows.length < result.totalMessages ? c.dim(` (showing ${rows.length})`) : '';
-    console.log(c.bold(`${plural(result.totalMessages, 'match')} in `) + c.yellow(inSession.shortId) + ' ' +
+    const shown = rows.length < totals.messages ? c.dim(` (showing ${rows.length})`) : '';
+    console.log(c.bold(`${plural(totals.messages, 'match')} in `) + c.yellow(inSession.shortId) + ' ' +
       sourceTag(inSession.source) + ' ' + c.dim(inSession.project) + shown);
+  } else if (outcome.partial) {
+    console.log(c.bold(`Newest ${plural(shownSessions.size, 'matching session')}`) +
+      c.dim(` (read ${outcome.partial.scanned} of ${plural(outcome.partial.available, 'session')}, newest first)`));
   } else {
-    const shown = shownSessions.size < result.totalSessions ? c.dim(` (showing ${shownSessions.size})`) : '';
-    console.log(c.bold(`${plural(result.totalMessages, 'match')} in ${plural(result.totalSessions, 'session')}`) + shown);
+    const shown = shownSessions.size < totals.sessions ? c.dim(` (showing ${shownSessions.size})`) : '';
+    console.log(c.bold(`${plural(totals.messages, 'match')} in ${plural(totals.sessions, 'session')}`) + shown);
   }
-  if (!opts.literal && SEARCH_MODE_NOTES[result.mode]) console.log(c.dim(SEARCH_MODE_NOTES[result.mode]));
+  if (!opts.literal && SEARCH_MODE_NOTES[outcome.mode]) console.log(c.dim(SEARCH_MODE_NOTES[outcome.mode]));
 
-  const prompts = opts.preview
-    ? await elastic.fetchPrompts(client, snapshot.index, [...shownSessions])
-    : new Map();
   const previewShown = new Set();
-  const spaced = contextN > 0 || Boolean(opts.preview);
+  const spaced = parseInt(opts.context) > 0 || Boolean(opts.preview);
   for (const row of rows) {
     if (inSession) {
       const time = row.timestamp ? formatRelativeTime(row.timestamp) : '';
@@ -1402,7 +1855,7 @@ async function runElasticSearch(query, opts, config) {
     if (rowLabels) console.log(c.dim(`    labels: ${rowLabels}`));
     if (opts.preview && !previewShown.has(row._sessionKey)) {
       previewShown.add(row._sessionKey);
-      printSessionPrompts((prompts.get(row._sessionKey) || []).map(p => ({
+      printSessionPrompts((outcome.prompts.get(row._sessionKey) || []).map(p => ({
         text: truncate(p.text, 100),
         time: p.timestamp ? formatRelativeTime(p.timestamp) : ''
       })));
@@ -1416,56 +1869,17 @@ async function runElasticSearch(query, opts, config) {
   if (inSession) {
     console.log(c.dim(`Read around a match: sessions show ${top.shortId} --around ${top.seq}`));
   } else {
-    if (shownSessions.size < result.totalSessions) printFacets(result.facets);
+    if (outcome.facets && shownSessions.size < totals.sessions) printFacets(outcome.facets);
     console.log(c.dim(`Drill in: add --session ${top.shortId} for every match in that session, or run: sessions show ${top.shortId} --around ${top.seq}`));
+    if (outcome.partial) console.log(c.dim('Older sessions were not read. Raise -n to go further back, or narrow with -p, --days or --since.'));
   }
-  console.log(c.dim(snapshotFooter(snapshot)));
-  return true;
+  if (outcome.footer) console.log(c.dim(outcome.footer));
 }
 
-// Decides which backend answers a search. Returns true when Elasticsearch
-// handled it; false means the caller should scan session files.
-async function searchWithElasticsearch(query, opts) {
-  const config = await loadConfig({ overrides: { backend: opts.local ? 'local' : undefined } });
-  if (config.warning) console.error(c.yellow(config.warning));
-  const es = config.elasticsearch;
-  const backend = config.search.backend;
-  const needsElastic = Boolean(opts.tools || opts.tool || opts.label?.length || opts.session);
-  const useElastic = backend === 'elasticsearch' || (backend === 'auto' && Boolean(es.url));
-
-  if (!useElastic) {
-    if (needsElastic) {
-      console.error(c.red(es.url
-        ? '--tools, --tool, --label and --session need the Elasticsearch index, and this search is set to scan files (--local or search.backend: local).'
-        : '--tools, --tool, --label and --session use the optional Elasticsearch index. Run "sessions sync" to set one up.'));
-      process.exit(1);
-    }
-    return false;
-  }
-
-  let failure;
-  if (!es.url) {
-    failure = 'No Elasticsearch URL is configured (set SESSIONS_ES_URL or elasticsearch.url in ~/.sessions/config.yaml)';
-  } else {
-    try {
-      const outcome = await runElasticSearch(query, opts, config);
-      if (outcome === true) return true;
-      failure = outcome;
-    } catch (error) {
-      if (error.name !== 'ElasticError') throw error;
-      failure = error.message;
-    }
-  }
-
-  if (backend === 'elasticsearch' || needsElastic) {
-    console.error(c.red(failure));
-    process.exit(1);
-  }
-  console.error(c.dim(`${failure}. Scanning session files instead.`));
-  return false;
-}
-
-const LOCAL_ES_COMMAND = 'docker run -d --name sessions-es -p 127.0.0.1:9220:9200 ' +
+// The named volume keeps the index, and the labels that live only in it, when
+// the container is removed; the restart policy brings it back with Docker.
+const LOCAL_ES_COMMAND = 'docker run -d --name sessions-es --restart unless-stopped -p 127.0.0.1:9220:9200 ' +
+  '-v sessions-es:/usr/share/elasticsearch/data ' +
   '-e discovery.type=single-node -e xpack.security.enabled=false ' +
   '-e ES_JAVA_OPTS="-Xms1g -Xmx1g" elasticsearch:8.19.25';
 
@@ -1479,7 +1893,7 @@ async function printSyncStatus(elastic, client, es, opts) {
   let pending = null;
   let labels = [];
   if (details) {
-    const local = await getSessionFiles(null, 'all');
+    const local = await getSessionFiles(null, 'all', { subagents: true });
     [pending, labels] = await Promise.all([
       elastic.indexedSessions(client, details.index).then(indexed => elastic.compareWithIndex(local, indexed)),
       elastic.labelSummary(client, details.index)
@@ -1519,7 +1933,7 @@ async function printSyncStatus(elastic, client, es, opts) {
   console.log(`${c.bold('Contents')}       ${plural(details.messages, 'message')} in ${plural(details.sessions, 'session')}, ${formatSize(details.storeBytes)} on disk`);
   const waiting = pending.changed + pending.added;
   const parts = [];
-  if (waiting > 0) parts.push(`${pending.changed} changed, ${pending.added} new ${c.dim('(run "sessions sync")')}`);
+  if (waiting > 0) parts.push(`${pending.changed} changed, ${pending.added} new ${c.dim(`(${formatSize(pending.bytes)} to read; run "sessions sync")`)}`);
   if (pending.missing > 0) parts.push(`${pending.missing} no longer on disk`);
   console.log(`${c.bold('Since sync')}     ${parts.length > 0 ? parts.join('; ') : 'no local changes'}`);
   if (labels.length > 0) {
@@ -1572,9 +1986,9 @@ async function runSync(opts) {
       return;
     }
 
-    const everything = await getSessionFiles(null, 'all');
+    const everything = await getSessionFiles(null, 'all', { subagents: true });
     const since = sinceFromOptions(opts);
-    let sessions = opts.project || opts.source !== 'all' ? await getSessionFiles(opts.project, opts.source) : everything;
+    let sessions = opts.project || opts.source !== 'all' ? await getSessionFiles(opts.project, opts.source, { subagents: true }) : everything;
     if (since) sessions = sessions.filter(s => s.modifiedAt >= since);
     const info = opts.dryRun ? null : await elastic.clusterInfo(client);
 
@@ -1613,6 +2027,7 @@ async function runSync(opts) {
       const notes = [];
       const sources = Object.entries(totals.bySource).map(([source, count]) => `${source} ${count}`).join(', ');
       if (sources) notes.push(totals.mode === 'update' ? `${sources}; ${plural(totals.unchanged, 'session')} unchanged` : sources);
+      if (totals.subagents > 0) notes.push(`${plural(totals.subagents, 'subagent transcript')} among them`);
       if (!totals.dryRun) notes.push(`${es.index} -> ${totals.index} at ${client.url} (Elasticsearch ${info.version})`);
       if (totals.reason === 'schema') notes.push('the index format changed, so it was rebuilt');
       if (totals.carried.sessions > 0) notes.push(`kept ${plural(totals.carried.sessions, 'session')} outside this run as they were`);
@@ -1669,7 +2084,7 @@ async function runLabel(sessionId, pairs, opts) {
       failWith(error.message);
     }
 
-    const sessions = await getSessionFiles(null, opts.source);
+    const sessions = await getSessionFiles(null, opts.source, { subagents: true });
     let session;
     try {
       session = resolveSession(sessions, sessionId);
@@ -1730,13 +2145,121 @@ async function runLabels(opts) {
   }
 }
 
+function tildePath(file) {
+  const home = os.homedir();
+  return file === home || file.startsWith(home + path.sep) ? `~${file.slice(home.length)}` : file;
+}
+
+const INIT_WORDS = {
+  created: ['created', 'would create'],
+  added: ['added', 'would add'],
+  updated: ['updated', 'would update'],
+  unchanged: ['already up to date', 'already up to date'],
+  removed: ['removed', 'would remove'],
+  absent: ['nothing to remove', 'nothing to remove']
+};
+
+// Adds, updates or removes the managed note in each installed agent's global
+// instructions file.
+async function runInit(opts) {
+  const agents = await import('./agents.js');
+  if (opts.print) {
+    process.stdout.write(agents.instructionBlock());
+    return;
+  }
+
+  const known = agents.agentTargets();
+  const wanted = (opts.agent || []).map(name => String(name).toLowerCase());
+  for (const name of wanted) {
+    if (!known.some(target => target.agent === name)) {
+      failWith(`Unknown agent "${name}". Expected one of: ${known.map(target => target.agent).join(', ')}.`);
+    }
+  }
+  const targets = wanted.length > 0 ? known.filter(target => wanted.includes(target.agent)) : known;
+
+  const results = [];
+  for (const target of targets) {
+    const result = { agent: target.agent, name: target.name, file: target.file, change: null, notes: [] };
+    results.push(result);
+    if (!existsSync(target.home)) {
+      result.change = 'not installed';
+      continue;
+    }
+    let existing = null;
+    try {
+      existing = await fs.readFile(target.file, 'utf8');
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        result.change = 'failed';
+        result.notes.push(error.message);
+        continue;
+      }
+    }
+    const { text, change } = opts.remove ? agents.removeBlock(existing) : agents.applyBlock(existing);
+    result.change = change;
+    if (!['unchanged', 'absent'].includes(change) && !opts.dryRun) {
+      try {
+        // A file that held nothing but the note goes away with it.
+        if (opts.remove && text === '') await fs.rm(target.file);
+        else await fs.writeFile(target.file, text);
+      } catch (error) {
+        result.change = 'failed';
+        result.notes.push(error.message);
+        continue;
+      }
+    }
+    if (opts.remove) continue;
+    if (target.shadowedBy) {
+      const shadow = await fs.readFile(target.shadowedBy, 'utf8').catch(() => '');
+      if (shadow.trim()) result.notes.push(`${target.name} reads ${tildePath(target.shadowedBy)} instead for as long as that file has content`);
+    }
+    if (agents.mentionsOutsideBlock(text)) {
+      result.notes.push(`${tildePath(target.file)} also describes sessions outside this note; that older text can go`);
+    }
+  }
+
+  if (opts.json) {
+    console.log(JSON.stringify(results, null, 2));
+  } else {
+    const nameWidth = Math.max(...results.map(result => result.name.length));
+    const fileWidth = Math.max(...results.map(result => tildePath(result.file).length));
+    for (const result of results) {
+      const said = result.change === 'not installed'
+        ? c.dim(`not installed (no ${tildePath(path.dirname(result.file))})`)
+        : result.change === 'failed'
+          ? c.red('failed')
+          : INIT_WORDS[result.change][opts.dryRun ? 1 : 0];
+      console.log(`${result.name.padEnd(nameWidth)}  ${tildePath(result.file).padEnd(fileWidth)}  ${said}`);
+      for (const note of result.notes) console.log(c.dim(`  ${note}`));
+    }
+  }
+
+  const installed = results.filter(result => result.change !== 'not installed');
+  if (installed.length === 0) {
+    failWith('No Claude Code, Codex or Kimi Code installation was found, so there is nothing to tell.');
+  }
+  if (results.some(result => result.change === 'failed')) process.exit(1);
+  if (opts.json || opts.dryRun) return;
+  if (opts.remove) return;
+  if (installed.some(result => ['created', 'added', 'updated'].includes(result.change))) {
+    console.log(c.dim('\nSessions started from now on will read it. "sessions init --remove" takes it out again.'));
+  }
+}
+
 if (process.argv[2] === '--serve') process.argv[2] = 'serve';
 
 program
   .name('sessions')
   .description('Search and browse Claude Code, Codex, and Kimi session transcripts')
   .version(pkg.version)
-  .option('--serve', 'Start the local web dashboard (alias for serve)');
+  .option('--serve', 'Start the local web dashboard (alias for serve)')
+  .addHelpText('after', `
+Most used:
+  sessions search "deploy staging"          messages containing both words; "phrase", OR and NOT work
+  sessions search "deploy" --session <id>   every match in one session
+  sessions show <id> --around 42            the conversation around match #42
+  sessions list -p <project> --days 7       recent sessions
+  sessions guide                            the whole tool in one screen, written for agents`);
 
 program
   .command('serve')
@@ -1759,10 +2282,11 @@ program
   .option('--days <n>', 'Sessions from last N days')
   .option('--full', 'Show full message counts (slower)')
   .option('--preview', 'Show first few prompts per session')
+  .option('--subagents', 'Include Claude subagent transcripts')
   .option('--source <source>', 'Session source: all, claude, codex, or kimi', parseSource, 'all')
   .option('--json', 'Output JSON')
   .action(async (opts) => {
-    let sessions = await getSessionFiles(opts.project, opts.source);
+    let sessions = await getSessionFiles(opts.project, opts.source, { subagents: Boolean(opts.subagents) });
     const limit = parseInt(opts.limit);
 
     const since = opts.days ? daysToSinceDate(parseInt(opts.days)) : opts.since ? new Date(opts.since) : null;
@@ -1784,6 +2308,14 @@ program
 
     if (shown.length === 0) {
       console.log('No sessions found.');
+      // With no filter in the way, say where sessions were expected.
+      if (!opts.project && !since) {
+        const roots = [];
+        if (opts.source === 'all' || opts.source === 'claude') roots.push(PROJECTS_DIR);
+        if (opts.source === 'all' || opts.source === 'codex') roots.push(CODEX_SESSIONS_DIR);
+        if (opts.source === 'all' || opts.source === 'kimi') roots.push(...KIMI_ROOTS.map(root => path.join(root, 'sessions')));
+        console.log(c.dim(`Looked in: ${roots.map(tildePath).join(', ')}`));
+      }
       return;
     }
 
@@ -1799,6 +2331,7 @@ program
         c.yellow(s.shortId) + ' ' +
         sourceTag(s.source) + ' ' +
         c.dim(s.project) + ' ' +
+        (s.subagent ? c.dim(`${subagentNote(s.parentSessionId)} `) : '') +
         c.cyan(time) + ' ' +
         (msgInfo ? c.dim(`(${msgInfo}) `) : '') +
         c.dim(formatSize(s.size))
@@ -1832,150 +2365,39 @@ program
   .command('search <query>')
   .description('Full-text search across session transcripts')
   .option('-p, --project <path>', 'Filter by project path')
-  .option('-n, --limit <n>', 'Max results', '10')
+  .option('-n, --limit <n>', 'Max sessions to show', '10')
   .option('-C, --context <n>', 'Context messages around match', '0')
   .option('--since <date>', 'Only search sessions modified since date (YYYY-MM-DD)')
   .option('--days <n>', 'Only search sessions from last N days')
   .option('--preview', 'Show first few prompts per matched session')
   .option('--source <source>', 'Session source: all, claude, codex, or kimi', parseSource, 'all')
   .option('--role <role>', 'Only match messages from: user or assistant', parseRole)
+  .option('--session <id>', 'Every match inside one session, in the order it was said')
+  .option('--per-session <n>', 'Matches shown per session (default: 1)', parseCount)
+  .option('--tools', 'Also search tool calls: commands, file paths, arguments')
+  .option('--tool <name>', 'Only match messages that called this tool, e.g. Bash')
+  .option('--literal', 'Match the query as one exact substring')
+  .option('--sort <order>', 'Result order: relevance or recent (without an index, sessions always come newest first)', parseSearchSort)
   .option('--local', 'Scan session files even when Elasticsearch is configured')
-  .option('--json', 'Output JSON')
-  .option('--session <id>', '[Elasticsearch] Every match inside one session, in the order it was said')
-  .option('--per-session <n>', '[Elasticsearch] Matches shown per session (default: 1)', parseCount)
-  .option('--sort <order>', '[Elasticsearch] Result order: relevance or recent', parseSearchSort)
-  .option('--tools', '[Elasticsearch] Also search tool calls: commands, file paths, arguments')
-  .option('--tool <name>', '[Elasticsearch] Only match messages that called this tool, e.g. Bash')
   .option('--label <key=value>', '[Elasticsearch] Only match labeled sessions or messages (repeatable)', collectOption)
-  .option('--literal', '[Elasticsearch] Match the query as an exact substring')
+  .option('--json', 'Output JSON')
   .addHelpText('after', `
-The query is matched as a case-insensitive substring of each message.
-
-Optional: once "sessions sync" has built an Elasticsearch index, search uses
-it instead. It lists the best match of each session, then where and when the
-rest are, and queries understand:
-  deploy staging        messages containing both words, in any form
+A query means the same with or without an index:
+  deploy staging        messages containing both words, in any order
   "exact phrase"        those words, in that order
   index.js              identifiers and paths match as a unit
   deploy OR release     either word (grep style works too: deploy\\|release)
   deploy NOT staging    exclude messages containing a word
-To get closer to a result:
+  login.*timeout        grep style: both, in that order
+Results list the best match of each session. To get closer:
   sessions search "deploy" --session a1b2c3d4     every match in that session
-  sessions show a1b2c3d4 --around 42              the conversation around #42`)
+  sessions show a1b2c3d4 --around 42              the conversation around #42
+
+Without an index, sessions are read newest first and words match as
+substrings. Optional: "sessions sync" builds an Elasticsearch index, which
+ranks results across everything, matches word forms and tolerates typos.`)
   .action(async (query, opts) => {
-    if (await searchWithElasticsearch(query, opts)) return;
-
-    let sessions = await getSessionFiles(opts.project, opts.source);
-    const limit = parseInt(opts.limit);
-    const contextN = parseInt(opts.context);
-    const lowerQuery = query.toLowerCase();
-    const results = [];
-    const sessionMatchCounts = new Map();
-    const sessionTotalCounts = new Map();
-
-    const since = sinceFromOptions(opts);
-    if (since) {
-      sessions = sessions.filter(s => s.modifiedAt >= since);
-    }
-
-    for (const session of sessions) {
-      if (results.length >= limit * 3) break;
-
-      const allMessages = [];
-      await streamSessionMessages(session, (data) => {
-        if (data.type === 'user' || data.type === 'assistant') {
-          allMessages.push(data);
-        }
-      });
-
-      let totalHits = 0;
-      for (let mi = 0; mi < allMessages.length; mi++) {
-        const data = allMessages[mi];
-        if (opts.role && data.type !== opts.role) continue;
-        const text = extractTextContent(data.message?.content);
-        if (!text || !text.toLowerCase().includes(lowerQuery)) continue;
-
-        totalHits++;
-        const key = sessionKey(session);
-        const count = sessionMatchCounts.get(key) || 0;
-        sessionMatchCounts.set(key, count + 1);
-
-        const matchLines = literalSnippets(text, query);
-
-        const contextMessages = [];
-        if (contextN > 0) {
-          const start = Math.max(0, mi - contextN);
-          const end = Math.min(allMessages.length - 1, mi + contextN);
-          for (let ci = start; ci <= end; ci++) {
-            if (ci === mi) continue;
-            const ctxData = allMessages[ci];
-            const ctxText = extractTextContent(ctxData.message?.content);
-            if (ctxText && ctxText.trim()) {
-              contextMessages.push({
-                type: ctxData.type,
-                text: truncate(ctxText, 150),
-                position: ci < mi ? 'before' : 'after'
-              });
-            }
-          }
-        }
-
-        results.push({
-          sessionId: session.sessionId,
-          shortId: session.shortId,
-          source: session.source,
-          project: session.project,
-          timestamp: data.timestamp,
-          type: data.type,
-          model: data.message?.model,
-          snippets: matchLines.slice(0, 2),
-          contextMessages,
-          _session: session
-        });
-      }
-
-      if (totalHits > 0) {
-        sessionTotalCounts.set(sessionKey(session), totalHits);
-      }
-    }
-
-    const sorted = results.sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0)).slice(0, limit);
-
-    if (opts.json) {
-      console.log(JSON.stringify(sorted.map(({ _session, ...rest }) => rest), null, 2));
-      return;
-    }
-
-    if (sorted.length === 0) {
-      console.log(`No matches for "${query}".`);
-      return;
-    }
-
-    console.log(c.bold(`${results.length} matches`) + c.dim(` (showing ${sorted.length})\n`));
-
-    const previewShown = new Set();
-
-    for (const r of sorted) {
-      printSearchMatch(r, sessionTotalCounts.get(sessionKey(r)) || 0);
-      if (opts.preview && !previewShown.has(sessionKey(r))) {
-        previewShown.add(sessionKey(r));
-        const prompts = [];
-        let count = 0;
-        await streamSessionMessages(r._session, (data) => {
-          if (data.type === 'user') {
-            const text = extractTextContent(data.message?.content);
-            if (text && text.trim()) {
-              const ts = data.timestamp ? formatRelativeTime(data.timestamp) : '';
-              prompts.push({ text: truncate(text, 100), time: ts });
-              count++;
-              if (count >= 5) return true;
-            }
-          }
-        });
-        printSessionPrompts(prompts);
-      }
-      console.log('');
-    }
+    printSearchOutcome(query, opts, await runSearch(query, opts));
   });
 
 program
@@ -1996,7 +2418,7 @@ program
       console.error(c.red('--user-only and --assistant-only cannot be used together.'));
       process.exit(1);
     }
-    const sessions = await getSessionFiles(null, opts.source);
+    const sessions = await getSessionFiles(null, opts.source, { subagents: true });
     let session;
     try {
       session = resolveSession(sessions, sessionId);
@@ -2015,7 +2437,7 @@ program
       // search index numbers them, so a search hit can be opened directly.
       const center = opts.around;
       const span = opts.context;
-      const showOpts = { noTools: opts.tools === false };
+      const showOpts = { noTools: opts.tools === false, userLabel: session.subagent ? 'Parent agent' : null };
       const before = [];
       const window = [];
       let position = -1;
@@ -2049,6 +2471,7 @@ program
       console.log(c.bold(`Session: ${session.sessionId}`));
       console.log(c.dim(`Source: ${session.source}`));
       console.log(c.dim(`Project: ${session.project}`));
+      for (const line of subagentHeader(session)) console.log(c.dim(line));
       console.log(c.dim(`Around #${center} of ${session.shortId}\n`));
       for (const { position: seq, data } of window) {
         const tag = seq === center ? c.bold.yellow(` #${seq}`) : c.dim(` #${seq}`);
@@ -2096,6 +2519,7 @@ program
     console.log(c.bold(`Session: ${session.sessionId}`));
     console.log(c.dim(`Source: ${session.source}`));
     console.log(c.dim(`Project: ${session.project}`));
+    for (const line of subagentHeader(session)) console.log(c.dim(line));
     console.log(c.dim(`Size: ${formatSize(session.size)}  Messages: ${messages.length}\n`));
 
     if (previewMode) {
@@ -2108,7 +2532,7 @@ program
       return;
     }
 
-    const showOpts = { noTools: noTools || opts.assistantOnly };
+    const showOpts = { noTools: noTools || opts.assistantOnly, userLabel: session.subagent ? 'Parent agent' : null };
     for (const msg of messages) {
       const formatted = formatMessageBlock(msg, showOpts);
       if (formatted !== null) console.log(formatted + '\n');
@@ -2157,7 +2581,7 @@ program
       console.error(c.red(`Unsupported format: ${opts.format}. Use md, json, or text.`));
       process.exit(1);
     }
-    const sessions = await getSessionFiles(null, opts.source);
+    const sessions = await getSessionFiles(null, opts.source, { subagents: true });
     let session;
     try {
       session = resolveSession(sessions, sessionId);
@@ -2454,6 +2878,32 @@ program
       console.log('');
     }
   });
+
+program
+  .command('guide')
+  .description('Print a one-screen reference, written for the agents that use this tool')
+  .action(async () => {
+    const { guideText } = await import('./agents.js');
+    process.stdout.write(guideText());
+  });
+
+program
+  .command('init')
+  .description('Tell your agents about sessions: keep a short note in each one\'s global instructions')
+  .option('--agent <name>', 'Only this agent: claude, codex, or kimi (repeatable)', collectOption)
+  .option('--print', 'Print the note instead of writing it anywhere')
+  .option('--dry-run', 'Show what would change without writing')
+  .option('--remove', 'Remove the note again')
+  .option('--json', 'Output JSON')
+  .addHelpText('after', `
+Agents use this tool, and one that was never told about it will not. This adds
+a short managed block to the instructions each installed agent already reads:
+  Claude Code   ~/.claude/CLAUDE.md
+  Codex         ~/.codex/AGENTS.md
+  Kimi Code     ~/.kimi-code/AGENTS.md
+Everything outside the block is left alone, and running it again updates the
+block in place. For a project-level file, paste the output of --print.`)
+  .action(runInit);
 
 program
   .command('sync')

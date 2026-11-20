@@ -473,8 +473,10 @@ test('show offset and limit apply after role filtering', () => {
 });
 
 test('search finds a Codex paired message exactly once', () => {
-  const data = json(['search', 'Codex unique needle', '--source', 'codex', '--limit', '20']);
-  assert.equal(data.filter(item => item.sessionId === CODEX_ID).length, 1);
+  const data = json(['search', 'Codex unique needle', '--source', 'codex', '--limit', '20', '--per-session', '5']);
+  const own = data.filter(item => item.sessionId === CODEX_ID);
+  assert.equal(own.length, 1);
+  assert.equal(own[0].matchesInSession, 1);
 });
 
 test('search supports literal regex punctuation', () => {
@@ -489,7 +491,12 @@ test('search finds response-only and event-only messages', () => {
 
 test('search excludes internal, developer, reasoning, and tool output text', () => {
   for (const query of ['environment needle', 'abort needle', 'developer secret', 'tool output secret', 'ignore-me']) {
-    assert.equal(json(['search', query, '--source', 'codex']).length, 0, query);
+    assert.equal(json(['search', query, '--source', 'codex', '--literal']).length, 0, query);
+    // A search that loosens to the closest matches still never shows them.
+    const loosened = JSON.stringify(json(['search', query, '--source', 'codex', '--per-session', '5']));
+    for (const hidden of ['internal environment needle', 'internal abort needle', 'developer secret needle', 'tool output secret needle']) {
+      assert(!loosened.includes(hidden), `${query} exposed "${hidden}"`);
+    }
   }
 });
 
@@ -679,8 +686,17 @@ test('modern Kimi show --assistant-only contains only text assistants', () => {
 test('modern Kimi search finds text but not injections, thinking, or tool internals', () => {
   assert.equal(json(['search', 'Kimi answer needle', '--source', 'kimi']).length, 1);
   for (const query of ['injected internal needle', 'kimi thinking secret', 'kimi tool output secret', 'kimi tool secret']) {
-    assert.equal(json(['search', query, '--source', 'kimi']).length, 0, query);
+    assert.equal(json(['search', query, '--source', 'kimi', '--literal']).length, 0, query);
+    const loosened = JSON.stringify(json(['search', query, '--source', 'kimi', '--per-session', '5']));
+    for (const hidden of ['injected internal needle', 'kimi thinking secret needle', 'kimi tool output secret needle']) {
+      assert(!loosened.includes(hidden), `${query} exposed "${hidden}"`);
+    }
   }
+  // What a tool was asked to do is searchable once message text has no match.
+  const [viaTool] = json(['search', 'kimi tool secret', '--source', 'kimi']);
+  assert.equal(viaTool.matchMode, 'tools');
+  assert.deepEqual(viaTool.tools, ['Shell']);
+  assert.match(viaTool.snippets.join(' '), /kimi tool secret needle/);
   const shown = JSON.stringify(json(['show', KIMI_ID, '--source', 'kimi']));
   assert(!shown.includes('kimi thinking secret needle'), 'thinking stays out of --json output');
 });
@@ -704,8 +720,8 @@ test('legacy Kimi session parses context records and skips internal roles', () =
   assert(!out.includes('legacy tool output secret needle'));
   assert(!out.includes('system prompt secret needle'));
 
-  assert.equal(json(['search', 'legacy thinking secret', '--source', 'kimi']).length, 0);
-  assert.equal(json(['search', 'legacy tool secret', '--source', 'kimi']).length, 0);
+  assert.equal(json(['search', 'legacy thinking secret', '--source', 'kimi', '--literal']).length, 0);
+  assert.equal(json(['search', 'legacy tool secret', '--source', 'kimi', '--literal']).length, 0);
   assert.equal(json(['search', 'Kimi legacy answer', '--source', 'kimi']).length, 1);
   const shown = JSON.stringify(json(['show', KIMI_LEGACY_ID, '--source', 'kimi']));
   assert(!shown.includes('legacy thinking secret needle'), 'thinking stays out of --json output');
@@ -775,10 +791,12 @@ test('desktop list uses the real prompt and show preserves custom tool calls', (
 });
 
 test('desktop context stays out of search and all export formats', () => {
-  assert.equal(json(['search', 'external_codex_apps_open_page', '--source', 'codex'], desktopEnv).length, 0);
-  assert.equal(json(['search', 'internal desktop snapshot', '--source', 'codex'], desktopEnv).length, 0);
-  assert.equal(json(['search', 'internal desktop plugins', '--source', 'codex'], desktopEnv).length, 0);
-  assert.equal(json(['search', 'Desktop prompt needle', '--source', 'codex'], desktopEnv).length, 2);
+  assert.equal(json(['search', 'external_codex_apps_open_page', '--source', 'codex', '--literal'], desktopEnv).length, 0);
+  assert.equal(json(['search', 'internal desktop snapshot', '--source', 'codex', '--literal'], desktopEnv).length, 0);
+  assert.equal(json(['search', 'internal desktop plugins', '--source', 'codex', '--literal'], desktopEnv).length, 0);
+  const [desktopHit] = json(['search', 'Desktop prompt needle', '--source', 'codex'], desktopEnv);
+  assert.equal(desktopHit.matchesInSession, 2);
+  assert.equal(json(['search', 'Desktop prompt needle', '--source', 'codex', '--per-session', '5'], desktopEnv).length, 2);
   for (const format of ['md', 'text', 'json']) {
     const out = run(['export', desktopId, '--source', 'codex', '--format', format], desktopEnv);
     assert(out.includes('Desktop answer needle.'));
@@ -862,10 +880,10 @@ test('queued prompts are read as user messages, in order', () => {
 });
 
 test('queued prompts are searchable and counted, notifications are not', () => {
-  const hits = json(['search', 'midturn needle'], queuedEnv);
+  const hits = json(['search', 'midturn needle', '--per-session', '5'], queuedEnv);
   assert.equal(hits.length, 3);
   assert.equal(hits.every(hit => hit.type === 'user'), true);
-  assert.equal(json(['search', 'background needle'], queuedEnv).length, 0);
+  assert.equal(json(['search', 'background needle', '--literal'], queuedEnv).length, 0);
   const [session] = json(['list', '--full'], queuedEnv);
   assert.equal(session.userCount, 4);
   assert.equal(session.assistantCount, 2);

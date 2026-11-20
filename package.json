@@ -1,14 +1,14 @@
 {
   "name": "@udx/sessions",
-  "version": "1.10.0",
-  "description": "Search, browse, export, and monitor Claude Code, Codex, and Kimi sessions from the CLI or a local dashboard, with optional Elasticsearch-backed search.",
+  "version": "1.11.0",
+  "description": "Search, browse, export, and monitor Claude Code, Codex, and Kimi sessions from the CLI or a local dashboard. Built for agents to recall and hand off work, with optional Elasticsearch-backed search.",
   "main": "index.js",
   "type": "module",
   "bin": {
     "sessions": "index.js"
   },
   "scripts": {
-    "test": "node test.js && node test-dual-source.js && node test-server.js && node test-markdown.js && node test-elastic.js"
+    "test": "node test.js && node test-dual-source.js && node test-server.js && node test-markdown.js && node test-elastic.js && node test-local-search.js && node test-transcripts.js && node test-agents.js"
   },
   "keywords": [
     "claude",
@@ -21,16 +21,13 @@
     "search",
     "ai-tools",
     "cli",
-    "elasticsearch"
+    "elasticsearch",
+    "agents",
+    "memory"
   ],
   "author": "UDX",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/udx/udx.dev.git",
-    "directory": "tools/sessions"
-  },
-  "homepage": "https://github.com/udx/udx.dev/tree/main/tools/sessions",
+  "homepage": "https://www.npmjs.com/package/@udx/sessions",
   "dependencies": {
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
