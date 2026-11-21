@@ -12,6 +12,7 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import { displayUrl, isLoopbackUrl, isValidIndexName, loadConfig } from './config.js';
 import { HIGHLIGHT_OPEN, HIGHLIGHT_CLOSE } from './query.js';
+import { createFrameWatch } from './zstd-frames.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(await fs.readFile(path.join(__dirname, 'package.json'), 'utf8'));
@@ -159,6 +160,21 @@ function zstdSupport() {
   return zstdReader;
 }
 
+// Some Node versions end a cut-off archive without an error. Whether this one
+// does is found out once, by handing the decoder nine bytes of a frame.
+let zstdQuiet;
+function zstdEndsQuietly() {
+  if (zstdQuiet === undefined) {
+    try {
+      zlib.zstdDecompressSync(Buffer.from('28b52ffd2001090000', 'hex'));
+      zstdQuiet = true;
+    } catch {
+      zstdQuiet = false;
+    }
+  }
+  return zstdQuiet;
+}
+
 const ZSTD_REQUIREMENT = 'reading .jsonl.zst needs Node 22.15 or newer, or the zstd command';
 
 // Opens a transcript as a stream of bytes, decompressing when it has to.
@@ -173,7 +189,15 @@ function openTranscript(filePath) {
     const decoder = zlib.createZstdDecompress({ chunkSize: 1 << 20 });
     source.on('error', error => decoder.destroy(error));
     source.pipe(decoder);
-    return { input: decoder, dispose: () => { source.destroy(); decoder.destroy(); } };
+    const opened = { input: decoder, dispose: () => { source.destroy(); decoder.destroy(); } };
+    if (zstdEndsQuietly()) {
+      // The decoder will not say the file was cut off, so its frames are
+      // followed on the way in.
+      const frames = createFrameWatch();
+      source.on('data', chunk => frames.write(chunk));
+      opened.problem = async () => (frames.cutShort() ? new Error('unexpected end of file') : null);
+    }
+    return opened;
   }
   if (reader === 'command') {
     const child = spawn('zstd', ['-dc', '--', filePath], { stdio: ['ignore', 'pipe', 'pipe'] });

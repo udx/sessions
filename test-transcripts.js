@@ -11,6 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
+import { createFrameWatch } from './zstd-frames.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI = path.join(__dirname, 'index.js');
@@ -143,7 +144,7 @@ const zstdBuiltIn = typeof zlib.zstdCompressSync === 'function';
 const zstdCommand = spawnSync('zstd', ['--version'], { stdio: 'ignore' }).status === 0;
 function compress(text) {
   if (zstdBuiltIn) return zlib.zstdCompressSync(Buffer.from(text));
-  const result = spawnSync('zstd', ['-c'], { input: text, maxBuffer: 1 << 28 });
+  const result = spawnSync('zstd', ['-c'], { input: text, maxBuffer: 1 << 28, timeout: 30_000 });
   return result.stdout;
 }
 const canCompress = zstdBuiltIn || zstdCommand;
@@ -327,6 +328,30 @@ if (canCompress) {
   } else {
     skip('the zstd command reads them on a Node without built-in support', 'zstd is not installed');
   }
+
+  // Node 22 ends a cut-off archive without an error, so there the reader
+  // follows the frames itself. This checks that on every Node.
+  test('a file cut anywhere is told from a whole one, however it arrives', () => {
+    const cutShort = (bytes, step) => {
+      const frames = createFrameWatch();
+      for (let at = 0; at < bytes.length; at += step) frames.write(bytes.subarray(at, at + step));
+      return frames.cutShort();
+    };
+    const small = compress('a platypus\n'.repeat(40));
+    const large = compress(Array.from({ length: 40_000 }, (_, i) => `line ${i} ${(i * 2654435761 % 4294967296).toString(36)}`).join('\n'));
+    for (const whole of [small, large]) {
+      for (const step of [1, 7, 1 << 16]) {
+        assert.equal(cutShort(whole, step), false, `whole file of ${whole.length} bytes`);
+        const cuts = whole.length < 400 ? [...whole.keys()] : [0, 1, 4, 5, 9, whole.length >> 2, whole.length >> 1, whole.length - 5, whole.length - 1];
+        for (const cut of cuts) assert.equal(cutShort(whole.subarray(0, cut), step), true, `cut at ${cut} of ${whole.length}`);
+      }
+    }
+    // Two frames in one file, then bytes after a frame that are not one.
+    const two = Buffer.concat([small, small]);
+    assert.equal(cutShort(two, 5), false);
+    assert.equal(cutShort(two.subarray(0, two.length - 1), 5), true);
+    assert.equal(cutShort(Buffer.concat([small, Buffer.from('not a frame')]), 5), false);
+  });
 } else {
   skip('compressed rollouts', 'this Node has no Zstandard support and zstd is not installed');
 }
