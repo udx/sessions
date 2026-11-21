@@ -28,6 +28,13 @@
   "author": "UDX",
   "license": "MIT",
   "homepage": "https://www.npmjs.com/package/@udx/sessions",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/udx/sessions.git"
+  },
+  "bugs": {
+    "url": "https://github.com/udx/sessions/issues"
+  },
   "dependencies": {
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
