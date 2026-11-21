@@ -27,7 +27,7 @@
   ],
   "author": "UDX",
   "license": "MIT",
-  "homepage": "https://www.npmjs.com/package/@udx/sessions",
+  "homepage": "https://sessions.tools",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/udx/sessions.git"

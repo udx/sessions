@@ -2,6 +2,8 @@
 
 Search, browse, export, and monitor Claude Code, Codex, and Kimi session transcripts from the command line or a local web dashboard.
 
+Website: [sessions.tools](https://sessions.tools), with a search you can try in the page.
+
 Sessions reads the local transcripts stored by Claude Code, Codex, and Kimi Code and provides full-text search, filtering, recap, and export across all three tools. Commands search all sources by default; use `--source claude`, `--source codex`, or `--source kimi` to narrow them.
 
 It is built to be run by the agents themselves: one agent can find what another did last week, pick up a session where it stopped, or check how a problem was solved before asking you again. [Tell your agents about it](#tell-your-agents-about-it) with one command.
