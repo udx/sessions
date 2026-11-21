@@ -459,6 +459,10 @@ Kimi Code sessions come in two on-disk generations, and both are read. Modern se
 
 Claude Code stores each session under `~/.claude/projects/<encoded-project>/`. Codex stores active rollouts under `~/.codex/sessions/YYYY/MM/DD/` and plain archived rollouts under `~/.codex/archived_sessions/`. Kimi Code stores sessions per working directory under `~/.kimi-code/sessions/` (and legacy `~/.kimi/sessions/`). Sessions normalizes all three formats while streaming files line by line. Project paths are resolved from Claude's session metadata, Codex's canonical `session_meta` record, or Kimi's `state.json` / `kimi.json` metadata.
 
+## Source and history
+
+`sessions` is built at [UDX](https://udx.io). It is developed in a private repository and published to [github.com/udx/sessions](https://github.com/udx/sessions) commit by commit, each with its own date, by the UDX robot account. Every version tag there is the exact source of the package npm serves for that version. 1.5.0 has no tag: it was published from a tree that was never committed, and 1.5.1 replaced it the same day.
+
 ## License
 
 MIT
