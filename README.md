@@ -8,6 +8,8 @@ Sessions reads the local transcripts stored by Claude Code, Codex, and Kimi Code
 
 It is built to be run by the agents themselves: one agent can find what another did last week, pick up a session where it stopped, or check how a problem was solved before asking you again. [Tell your agents about it](#tell-your-agents-about-it) with one command.
 
+![A Codex agent uses sessions to search local Kimi, Codex and Claude Code transcripts and retrieve an exact answer from an earlier Claude session.](docs/assets/cross-agent-memory.svg)
+
 Search works out of the box by reading the transcript files. Point it at an Elasticsearch instance and the same queries are ranked, typo-tolerant and answered in a fraction of a second, with labels for classifying sessions. See [Elasticsearch search](#elasticsearch-search).
 
 | Source | Sessions | Prompt history |

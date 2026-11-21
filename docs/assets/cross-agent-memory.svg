@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" xml:space="preserve" viewBox="0 0 1120 560" role="img" aria-labelledby="cam-title cam-desc">
+  <title id="cam-title">One agent searches what another agent already worked out</title>
+  <desc id="cam-desc">On the left, a Codex agent runs one sessions search for "staging timeout". A single green path crosses the local transcripts of Kimi, Codex and Claude Code, which are stacked on the right, each labeled with its source and folder. The path stops at the Claude Code session, message 14, where the matching line is highlighted: the staging gateway timeout was 5s and was set to 30s. The result, one match in one session, returns to the Codex agent as the exact prior answer. The transcript text is illustrative.</desc>
+
+  <rect x="0" y="0" width="1120" height="560" fill="#f4f6f1"/>
+
+  <!-- Headline -->
+  <text x="40" y="60" font-family="'IBM Plex Sans',system-ui,sans-serif" font-size="28" font-weight="700" fill="#182019">Search what another agent already figured out</text>
+
+  <!-- Step labels -->
+  <text x="50" y="101" text-anchor="middle" font-family="'IBM Plex Sans',system-ui,sans-serif" font-size="14" font-weight="700" fill="#182019">1</text>
+  <text x="70" y="102" font-family="'IBM Plex Sans',system-ui,sans-serif" font-size="15" font-weight="700" fill="#182019">The current agent asks</text>
+  <text x="530" y="101" text-anchor="middle" font-family="'IBM Plex Sans',system-ui,sans-serif" font-size="14" font-weight="700" fill="#182019">2</text>
+  <text x="550" y="102" font-family="'IBM Plex Sans',system-ui,sans-serif" font-size="15" font-weight="700" fill="#182019">One search crosses every tool's past sessions</text>
+
+  <!-- Current agent: the command -->
+  <g id="agent">
+    <rect x="40" y="116" width="400" height="100" fill="#ffffff" stroke="#cbd4c8" stroke-width="1.5"/>
+    <rect x="40" y="116" width="400" height="28" fill="#182019"/>
+    <text x="54" y="135" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="14" font-weight="700" fill="#f4f6f1">[codex]</text>
+    <text x="126" y="135" font-family="'IBM Plex Sans',system-ui,sans-serif" font-size="14" fill="#f4f6f1">current agent, /work/shop-api</text>
+    <text x="54" y="176" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="14" fill="#182019">$ sessions search "staging timeout"</text>
+    <text x="54" y="201" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="13" fill="#5f6d63"># run by the agent itself, locally</text>
+  </g>
+
+  <!-- Source transcripts -->
+  <g id="sources">
+    <!-- kimi -->
+    <rect x="520" y="116" width="560" height="100" fill="#ffffff" stroke="#cbd4c8" stroke-width="1.5"/>
+    <rect x="520" y="116" width="8" height="100" fill="#347d8a"/>
+    <text x="572" y="142" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="14" font-weight="700" fill="#347d8a">[kimi]</text>
+    <text x="640" y="142" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="13" fill="#5f6d63">~/.kimi-code/sessions/</text>
+    <text x="572" y="172" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="14" fill="#5f6d63">#11 you     draft the release notes</text>
+    <text x="572" y="198" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="14" fill="#5f6d63">#12 kimi    Release notes: checkout rewrite.</text>
+    <!-- codex -->
+    <rect x="520" y="246" width="560" height="100" fill="#ffffff" stroke="#cbd4c8" stroke-width="1.5"/>
+    <rect x="520" y="246" width="8" height="100" fill="#8956a8"/>
+    <text x="572" y="272" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="14" font-weight="700" fill="#8956a8">[codex]</text>
+    <text x="650" y="272" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="13" fill="#5f6d63">~/.codex/sessions/</text>
+    <text x="572" y="302" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="14" fill="#5f6d63">#8  you     add retry to the cart service</text>
+    <text x="572" y="328" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="14" fill="#5f6d63">#9  codex   Added retry with backoff in cart.ts</text>
+    <!-- claude -->
+    <rect x="520" y="376" width="560" height="100" fill="#ffffff" stroke="#cbd4c8" stroke-width="1.5"/>
+    <rect x="520" y="376" width="8" height="100" fill="#3568b8"/>
+    <text x="572" y="402" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="14" font-weight="700" fill="#3568b8">[claude]</text>
+    <text x="660" y="402" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="13" fill="#5f6d63">~/.claude/projects/</text>
+    <text x="572" y="432" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="14" fill="#5f6d63">#13 you     why does checkout time out on staging?</text>
+    <rect x="564" y="442" width="506" height="24" fill="#55f57a"/>
+    <text x="572" y="459" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="14" font-weight="700" fill="#182019">#14 claude  Staging gateway timeout was 5s; set 30s.</text>
+  </g>
+
+  <!-- Gap labels -->
+  <text x="572" y="236" font-family="'IBM Plex Sans',system-ui,sans-serif" font-size="13" fill="#5f6d63">read from the local transcript files</text>
+  <text x="572" y="366" font-family="'IBM Plex Sans',system-ui,sans-serif" font-size="13" fill="#5f6d63">all three tools searched by default</text>
+
+  <!-- The search path: agent -> across every source -> the match -->
+  <g id="search-path" fill="none" stroke-linejoin="miter">
+    <path d="M440,170 H548 V454 H452" stroke="#182019" stroke-width="12"/>
+    <path d="M440,170 H548 V454 H452" stroke="#55f57a" stroke-width="8"/>
+  </g>
+  <polygon points="440,454 458,443 458,465" fill="#55f57a" stroke="#182019" stroke-width="1.5" stroke-linejoin="miter"/>
+
+  <!-- Result -->
+  <g id="result">
+    <rect x="40" y="376" width="400" height="100" fill="#ffffff" stroke="#cbd4c8" stroke-width="1.5"/>
+    <rect x="40" y="376" width="400" height="28" fill="#55f57a"/>
+    <text x="54" y="395" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="14" font-weight="700" fill="#182019">1 match in 1 session</text>
+    <text x="54" y="430" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="13" fill="#5f6d63">a1b2c3d4 [claude] claude 2 days ago #14</text>
+    <text x="54" y="456" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="14" font-weight="700" fill="#182019">Staging gateway timeout was 5s; set 30s.</text>
+  </g>
+
+  <!-- Return: the answer becomes available to the current agent -->
+  <g id="return" fill="none">
+    <path d="M52,376 V238" stroke="#182019" stroke-width="12"/>
+    <path d="M52,376 V238" stroke="#55f57a" stroke-width="8"/>
+  </g>
+  <polygon points="52,218 41,240 63,240" fill="#55f57a" stroke="#182019" stroke-width="1.5" stroke-linejoin="miter"/>
+  <text x="94" y="281" text-anchor="middle" font-family="'IBM Plex Sans',system-ui,sans-serif" font-size="14" font-weight="700" fill="#182019">3</text>
+  <text x="114" y="282" font-family="'IBM Plex Sans',system-ui,sans-serif" font-size="15" font-weight="700" fill="#182019">The exact answer comes back</text>
+  <text x="114" y="303" font-family="'IBM Plex Sans',system-ui,sans-serif" font-size="15" font-weight="700" fill="#182019">into the current agent's work</text>
+
+  <!-- Footer -->
+  <line x1="40" y1="506" x2="1080" y2="506" stroke="#cbd4c8" stroke-width="1.5"/>
+  <text x="40" y="530" font-family="'IBM Plex Sans',system-ui,sans-serif" font-size="13" fill="#5f6d63">Illustrative transcripts. sessions reads Claude Code, Codex and Kimi Code transcripts on this machine; --source narrows a search to one tool.</text>
+</svg>
