@@ -51,7 +51,7 @@ sessions serve --port 4220 --open
 sessions serve --active-minutes 30
 ```
 
-Open `http://127.0.0.1:4220` to browse all active and past sessions in a minimalist light or dark interface. The dashboard shows each session's source, prompt or title, project folder, last activity, model, message counts, size, and seven-day activity histogram. Filter by status, source, project, or search text. Select a title to reveal its full first prompt, additional details, and recent conversation with formatted Markdown links, lists, code, and tables; load earlier messages inline without leaving the list. Raw HTML remains escaped text and unsafe links are blocked. Expanded rows stay open during refreshes. **Copy command** copies the native CLI command (`claude --resume`, `codex resume`, or `kimi --session`) with the correct project directory.
+Open `http://127.0.0.1:4220` to browse all active and past sessions, in a dark or light interface that follows your system. A rail on the left filters by agent and by project, each with a count; the list shows each session's agent, prompt or title, short ID, model, project folder, message count, seven-day activity and last activity. Filter by status, agent, project, or search text. Select a title to reveal its full first prompt, additional details, and recent conversation with formatted Markdown links, lists, code, and tables; load earlier messages inline without leaving the list. Raw HTML remains escaped text and unsafe links are blocked. Expanded rows stay open during refreshes. **Copy command** copies the native CLI command (`claude --resume`, `codex resume`, or `kimi --session`) with the correct project directory.
 
 The page refreshes every 60 seconds and on demand. Sessions modified within the last 15 minutes count as active; archived sessions always count as past. Metadata is cached by transcript modification time and size, so refreshes only reread changed sessions. The server binds to localhost by default because session metadata is private. Use `--host` only if you understand the exposure, `--port 0` to choose a free port, and `--open` to launch a browser. Press Ctrl+C to stop the server.
 
@@ -164,7 +164,7 @@ Shows a compact cross-project timeline grouped by project. Useful for getting a 
 ```bash
 sessions history
 sessions history -s "deploy" -n 50
-sessions history -p /opt/sources/udx.dev --source codex
+sessions history -p my-project --source codex
 ```
 
 ## Elasticsearch search
@@ -359,6 +359,10 @@ Claude Code deletes transcripts after 30 days unless `cleanupPeriodDays` in `~/.
 Kimi Code sessions come in two on-disk generations, and both are read. Modern sessions live under `~/.kimi-code/sessions/wd_<slug>_<hash>/session_<uuid>/`; the project path and title come from `state.json` and the transcript is reconstructed from the main agent's event-sourced `agents/main/wire.jsonl` (user inputs from `context.append_message` events with `origin.kind: user`, assistant output grouped per step, model from `llm.request`). Legacy sessions under `~/.kimi/sessions/<md5(workdir)>/<uuid>/` are read from the ready-made `context.jsonl`, with the project path resolved through `kimi.json`'s `work_dirs` or, failing that, the session's system prompt. Kimi's `user-history` files carry no timestamps, so those history entries sort after timestamped ones; thinking blocks, tool results, and injected system reminders are never shown or searched.
 
 ## Changelog
+
+### Unreleased
+- The dashboard is laid out as a tool: a rail on the left filters by agent and project with counts, and sessions are listed in a dense table, about three times as many per screen. Agents are named the way the command line prints them (`[claude]`, `[codex]`, `[kimi]`). The typefaces ship with the tool, so the page still loads nothing from outside your machine
+- A compressed Codex session that was cut off is reported on Node 22 as well. That version's built-in decoder ends such a file without an error, so the tool now follows the archive's frames itself
 
 ### 1.11.0
 - Search means the same with or without Elasticsearch. The file scan now understands the full query language (words in any order, `"phrases"`, `OR`, `NOT`, grep-style `a\|b` and `a.*b`), shows one row per session with its position for `show --around`, and loosens step by step when nothing matches outright. `--session`, `--per-session`, `--tools`, `--tool` and `--literal` no longer need an index. A multi-word query used to be matched as one exact phrase without an index; `--literal` keeps that

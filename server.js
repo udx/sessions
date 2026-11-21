@@ -9,7 +9,11 @@ const staticFiles = new Map([
   ['/', ['dashboard.html', 'text/html; charset=utf-8']],
   ['/dashboard.css', ['dashboard.css', 'text/css; charset=utf-8']],
   ['/markdown.js', ['markdown.js', 'text/javascript; charset=utf-8']],
-  ['/dashboard.js', ['dashboard.js', 'text/javascript; charset=utf-8']]
+  ['/dashboard.js', ['dashboard.js', 'text/javascript; charset=utf-8']],
+  // The typefaces ship with the tool: the page may not load anything from
+  // outside this machine.
+  ...['ibm-plex-sans-400', 'ibm-plex-sans-500', 'ibm-plex-mono-400', 'ibm-plex-mono-500']
+    .map(name => [`/fonts/${name}.woff2`, [`fonts/${name}.woff2`, 'font/woff2']])
 ]);
 
 function isoTimestamp(value) {

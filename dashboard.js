@@ -3,7 +3,10 @@ const state = {
   status: 'all',
   source: 'all',
   project: 'all',
-  query: ''
+  query: '',
+  sourceOrder: [],
+  projectOrder: [],
+  projectLabels: new Map()
 };
 
 const elements = {
@@ -13,9 +16,9 @@ const elements = {
   refresh: document.querySelector('#refresh-button'),
   refreshStatus: document.querySelector('#refresh-status'),
   search: document.querySelector('#search-input'),
-  source: document.querySelector('#source-filter'),
-  project: document.querySelector('#project-filter'),
-  advancedFilters: document.querySelector('#advanced-filters'),
+  rail: document.querySelector('.rail'),
+  sources: document.querySelector('#source-list'),
+  projects: document.querySelector('#project-list'),
   clear: document.querySelector('#clear-button'),
   results: document.querySelector('#results-count'),
   toast: document.querySelector('#toast')
@@ -75,34 +78,37 @@ function formatSize(bytes) {
   return `${(bytes / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
 }
 
-function sourceName(source) {
-  return source.charAt(0).toUpperCase() + source.slice(1);
+// An agent is named the way the command line prints it: [claude], [codex], [kimi].
+function sourceTag(source) {
+  return element('span', `tag tag-${source}`, `[${source}]`);
 }
 
-function baseFilteredSessions() {
-  const query = state.query.trim().toLowerCase();
-  return state.sessions.filter(session => {
-    if (state.source !== 'all' && session.source !== state.source) return false;
-    if (state.project !== 'all' && session.project !== state.project) return false;
-    if (!query) return true;
-    return [
-      session.title,
-      session.firstPrompt,
-      session.project,
-      session.model,
-      session.sessionId,
-      session.shortId,
-      session.source
-    ].some(value => String(value || '').toLowerCase().includes(query));
-  });
+// Whether a session passes the current filters. A facet in the rail counts
+// the sessions that pass every filter but its own.
+function matches(session, query, { source = true, project = true } = {}) {
+  if (source && state.source !== 'all' && session.source !== state.source) return false;
+  if (project && state.project !== 'all' && session.project !== state.project) return false;
+  if (state.status === 'active' && !session.active) return false;
+  if (state.status === 'past' && session.active) return false;
+  if (!query) return true;
+  return [
+    session.title,
+    session.firstPrompt,
+    session.project,
+    session.model,
+    session.sessionId,
+    session.shortId,
+    session.source
+  ].some(value => String(value || '').toLowerCase().includes(query));
+}
+
+function currentQuery() {
+  return state.query.trim().toLowerCase();
 }
 
 function filteredSessions() {
-  return baseFilteredSessions().filter(session => {
-    if (state.status === 'active') return session.active;
-    if (state.status === 'past') return !session.active;
-    return true;
-  });
+  const query = currentQuery();
+  return state.sessions.filter(session => matches(session, query));
 }
 
 function updateStats() {
@@ -113,43 +119,116 @@ function updateStats() {
   document.querySelector('#projects-stat').textContent = numberFormat.format(projects.size);
 }
 
-function renderProjects() {
-  const previous = state.project;
-  const projects = [...new Set(state.sessions.map(session => session.project))]
-    .sort((a, b) => a.localeCompare(b));
-  elements.project.replaceChildren(element('option', '', 'All project folders'));
-  elements.project.firstElementChild.value = 'all';
+// Folder names repeat under different parents, so a name that is not unique
+// is shown with its parent.
+function projectLabels(projects) {
+  const parts = project => project.replace(/\/+$/, '').split('/').filter(Boolean);
+  const base = project => parts(project).pop() || project;
+  const uses = new Map();
+  for (const project of projects) uses.set(base(project), (uses.get(base(project)) || 0) + 1);
+  const labels = new Map();
   for (const project of projects) {
-    const option = element('option', '', project);
-    option.value = project;
-    elements.project.append(option);
+    const shared = uses.get(base(project)) > 1 && parts(project).length > 1;
+    labels.set(project, shared ? parts(project).slice(-2).join('/') : base(project));
   }
-  elements.project.value = projects.includes(previous) ? previous : 'all';
-  state.project = elements.project.value;
+  return labels;
+}
+
+// Projects are listed most recently used first, in an order that does not
+// change while filtering, so a row stays where it was.
+function indexSessions() {
+  const latest = new Map();
+  for (const session of state.sessions) {
+    const at = Date.parse(session.lastActiveAt) || 0;
+    if (!latest.has(session.project) || at > latest.get(session.project)) latest.set(session.project, at);
+  }
+  state.projectOrder = [...latest.keys()].sort((a, b) => latest.get(b) - latest.get(a) || a.localeCompare(b));
+  state.projectLabels = projectLabels(state.projectOrder);
+  if (state.project !== 'all' && !latest.has(state.project)) state.project = 'all';
+
+  const known = ['claude', 'codex', 'kimi'];
+  const present = new Set(state.sessions.map(session => session.source));
+  state.sourceOrder = [...known.filter(source => present.has(source)), ...[...present].filter(source => !known.includes(source)).sort()];
+  if (state.source !== 'all' && !present.has(state.source)) state.source = 'all';
+}
+
+function railItem(content, count, pressed, facet, value, title) {
+  const button = element('button', 'rail-item');
+  button.type = 'button';
+  button.dataset.facet = facet;
+  button.dataset.value = value;
+  button.setAttribute('aria-pressed', String(pressed));
+  if (title) button.title = title;
+  const name = element('span', 'rail-name');
+  name.append(content);
+  button.append(name, element('span', 'rail-count', numberFormat.format(count)));
+  return button;
+}
+
+function renderRail() {
+  const query = currentQuery();
+  const focused = document.activeElement?.closest?.('.rail-item');
+  const focusedKey = focused ? [focused.dataset.facet, focused.dataset.value] : null;
+
+  const bySource = new Map();
+  const byProject = new Map();
+  let sourceTotal = 0;
+  let projectTotal = 0;
+  for (const session of state.sessions) {
+    if (matches(session, query, { source: false })) {
+      sourceTotal++;
+      bySource.set(session.source, (bySource.get(session.source) || 0) + 1);
+    }
+    if (matches(session, query, { project: false })) {
+      projectTotal++;
+      byProject.set(session.project, (byProject.get(session.project) || 0) + 1);
+    }
+  }
+
+  const sources = [railItem('All agents', sourceTotal, state.source === 'all', 'source', 'all')];
+  for (const source of state.sourceOrder) {
+    sources.push(railItem(sourceTag(source), bySource.get(source) || 0, state.source === source, 'source', source));
+  }
+  elements.sources.replaceChildren(...sources);
+
+  const projects = [railItem('All projects', projectTotal, state.project === 'all', 'project', 'all')];
+  for (const project of state.projectOrder) {
+    const count = byProject.get(project) || 0;
+    if (count === 0 && state.project !== project) continue;
+    projects.push(railItem(state.projectLabels.get(project), count, state.project === project, 'project', project, project));
+  }
+  elements.projects.replaceChildren(...projects);
+
+  if (focusedKey) {
+    const again = [...elements.rail.querySelectorAll('.rail-item')]
+      .find(item => item.dataset.facet === focusedKey[0] && item.dataset.value === focusedKey[1]);
+    if (again) again.focus();
+  }
 }
 
 function createActivityChart(session) {
-  const chart = element('div', 'activity-chart');
+  const chart = element('div', 'cell-activity activity-chart');
   const days = session.activity || [];
   const total = days.reduce((sum, day) => sum + day.count, 0);
   chart.title = `Last 7 days: ${numberFormat.format(total)} messages`;
 
   const namespace = 'http://www.w3.org/2000/svg';
   const svg = document.createElementNS(namespace, 'svg');
-  svg.setAttribute('viewBox', '0 0 140 28');
+  svg.setAttribute('viewBox', '0 0 80 20');
   svg.setAttribute('role', 'img');
   svg.setAttribute('aria-label', `${total} messages over the last seven days`);
   const maximum = Math.max(1, ...days.map(day => day.count));
   days.forEach((day, index) => {
     const date = new Date(`${day.date}T12:00:00`);
-    const height = day.count ? Math.max(3, Math.round(day.count / maximum * 26)) : 1;
+    const today = index === days.length - 1;
+    const height = day.count ? Math.max(2, Math.round(day.count / maximum * 20)) : 2;
     const bar = document.createElementNS(namespace, 'rect');
-    bar.setAttribute('x', String(index * 20 + 2));
-    bar.setAttribute('y', String(28 - height));
-    bar.setAttribute('width', '12');
+    bar.setAttribute('x', String(index * 12));
+    bar.setAttribute('y', String(20 - height));
+    bar.setAttribute('width', '8');
     bar.setAttribute('height', String(height));
-    bar.setAttribute('rx', '1');
-    bar.setAttribute('class', `activity-bar${day.count ? '' : ' empty'}${index === days.length - 1 ? ' today' : ''}`);
+    const kind = !day.count ? ' empty' : today && session.active ? ' live' : today ? ' today' : '';
+    bar.setAttribute('class', `activity-bar${kind}`);
     const label = `${date.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}: ${day.count} ${day.count === 1 ? 'message' : 'messages'}`;
     const title = document.createElementNS(namespace, 'title');
     title.textContent = label;
@@ -227,7 +306,7 @@ function renderTranscript(details, data) {
   for (const message of data.messages) {
     const row = element('div', `transcript-message ${message.type}`);
     const heading = element('div', 'transcript-message-heading');
-    heading.append(element('span', 'transcript-speaker', message.type === 'user' ? 'You' : sourceName(message.source)));
+    heading.append(message.type === 'user' ? element('span', 'transcript-speaker', 'you') : sourceTag(message.source));
     if (message.timestamp) heading.append(element('time', 'transcript-time', formatRelativeTime(message.timestamp)));
     const text = element('div', 'transcript-text markdown-body');
     text.append(renderSessionMarkdown(message.text));
@@ -275,15 +354,15 @@ async function loadEarlier(button, details, session) {
 }
 
 function createSessionCard(session) {
-  const card = element('article', 'session-card');
-  const main = element('div', 'session-main');
-  const titleLine = element('div', 'session-title-line');
+  const card = element('article', `session-card${session.active ? ' active' : ''}`);
+  const row = element('div', 'row-grid');
+
+  const cell = element('div', 'cell-session');
+  const status = element('span', `session-status${session.active ? ' active' : ''}`);
   if (session.active) {
-    const status = element('span', 'session-status active');
     status.title = 'Active session';
     status.setAttribute('role', 'img');
     status.setAttribute('aria-label', 'Active session');
-    titleLine.append(status);
   }
 
   const title = element('h2', 'session-title');
@@ -295,34 +374,37 @@ function createSessionCard(session) {
   expand.setAttribute('aria-label', `Show details for ${session.title || session.shortId}`);
   expand.title = `${session.shortId} · ${session.firstPrompt || session.title || ''}`;
   title.append(expand);
-  titleLine.append(title);
 
-  const project = element('div', 'project-row');
+  const sub = element('div', 'session-sub');
+  sub.append(element('span', 'session-id', session.shortId));
+  if (session.model) sub.append(element('span', 'model-name', session.model));
+  if (session.archived) sub.append(element('span', '', 'Archived'));
+  cell.append(status, sourceTag(session.source), title, sub);
+
+  const project = element('div', 'cell-project', state.projectLabels.get(session.project) || session.project);
   project.title = session.project;
-  project.append(element('span', 'project-path', session.project));
 
-  const meta = element('div', 'session-meta');
-  meta.append(element('span', '', sourceName(session.source)));
-  meta.append(element('span', '', `${numberFormat.format(session.messageCount)} ${session.messageCount === 1 ? 'message' : 'messages'}`));
-  if (session.model) meta.append(element('span', 'model-name', session.model));
-  if (session.archived) meta.append(element('span', '', 'Archived'));
+  const count = element('div', 'cell-count', numberFormat.format(session.messageCount));
+  count.title = `${numberFormat.format(session.messageCount)} ${session.messageCount === 1 ? 'message' : 'messages'}`;
 
-  main.append(titleLine, project, meta);
-
-  const side = element('div', 'session-side');
+  const time = element('div', 'cell-time');
   const relative = element('div', `last-active${session.active ? ' active' : ''}`, formatRelativeTime(session.lastActiveAt));
   relative.dataset.relativeTime = session.lastActiveAt;
   const exact = element('time', 'exact-time', formatExactTime(session.lastActiveAt));
   exact.dateTime = session.lastActiveAt;
   exact.title = new Date(session.lastActiveAt).toLocaleString();
+  time.append(relative, exact);
+
+  const action = element('div', 'cell-action');
   const copy = element('button', 'button resume-button', 'Copy command');
   copy.type = 'button';
   copy.dataset.command = session.resumeCommand;
   copy.title = session.resumeCommand;
   copy.setAttribute('aria-label', `Copy command to resume ${session.title || session.shortId}`);
-  side.append(relative, exact, createActivityChart(session), copy);
+  action.append(copy);
 
-  card.append(main, side);
+  row.append(cell, project, count, createActivityChart(session), time, action);
+  card.append(row);
   if (expandedSessions.has(sessionKey(session))) {
     const details = createSessionDetails(session);
     details.hidden = false;
@@ -336,20 +418,19 @@ function createSessionCard(session) {
 function render() {
   const sessions = filteredSessions();
   const hasFilters = Boolean(state.query) || state.source !== 'all' || state.project !== 'all' || state.status !== 'all';
-  const hasAdvancedFilters = state.source !== 'all' || state.project !== 'all';
   elements.list.replaceChildren(...sessions.map(createSessionCard));
   elements.list.setAttribute('aria-busy', 'false');
   elements.empty.hidden = sessions.length > 0 || !attemptedLoad;
   elements.results.hidden = !hasFilters;
   elements.results.textContent = `${numberFormat.format(sessions.length)} shown`;
-  elements.advancedFilters.classList.toggle('has-active', hasAdvancedFilters);
   elements.clear.hidden = !hasFilters;
+  renderRail();
   updateStats();
 }
 
 function updateRefreshStatus() {
   if (refreshing) {
-    elements.refreshStatus.textContent = 'Refreshing sessions…';
+    elements.refreshStatus.textContent = 'Reading sessions';
   } else if (refreshFailed) {
     elements.refreshStatus.textContent = lastUpdated ? 'Refresh failed · will retry' : 'Could not load sessions';
   } else if (lastUpdated) {
@@ -382,7 +463,7 @@ async function refreshSessions() {
   if (refreshing) return;
   refreshing = true;
   elements.refresh.disabled = true;
-  elements.refresh.textContent = 'Refreshing…';
+  elements.refresh.textContent = 'Refreshing';
   if (!attemptedLoad) elements.list.setAttribute('aria-busy', 'true');
   updateRefreshStatus();
 
@@ -396,14 +477,14 @@ async function refreshSessions() {
     refreshFailed = false;
     attemptedLoad = true;
     elements.empty.querySelector('h2').textContent = 'No sessions found';
-    elements.empty.querySelector('p').textContent = 'Try another search or clear the filters.';
-    renderProjects();
+    elements.empty.querySelector('p').textContent = 'Try another search or clear the filters';
+    indexSessions();
     render();
   } catch (error) {
     refreshFailed = true;
     if (!attemptedLoad) {
       elements.empty.querySelector('h2').textContent = 'Could not load sessions';
-      elements.empty.querySelector('p').textContent = 'Check the terminal running sessions --serve for details.';
+      elements.empty.querySelector('p').textContent = 'Check the terminal running sessions --serve for details';
       elements.empty.hidden = false;
     }
     console.error(error);
@@ -423,12 +504,10 @@ elements.search.addEventListener('input', () => {
   state.query = elements.search.value;
   render();
 });
-elements.source.addEventListener('change', () => {
-  state.source = elements.source.value;
-  render();
-});
-elements.project.addEventListener('change', () => {
-  state.project = elements.project.value;
+elements.rail.addEventListener('click', event => {
+  const item = event.target.closest('.rail-item');
+  if (!item) return;
+  state[item.dataset.facet] = item.dataset.value;
   render();
 });
 elements.clear.addEventListener('click', () => {
@@ -437,9 +516,6 @@ elements.clear.addEventListener('click', () => {
   state.project = 'all';
   state.status = 'all';
   elements.search.value = '';
-  elements.source.value = 'all';
-  elements.project.value = 'all';
-  elements.advancedFilters.open = false;
   document.querySelectorAll('.tab').forEach(tab => {
     const selected = tab.dataset.status === 'all';
     tab.classList.toggle('selected', selected);

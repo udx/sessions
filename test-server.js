@@ -199,6 +199,15 @@ try {
   assert(html.includes('Refreshes automatically every 60 seconds.'));
   assert(html.includes('/markdown.js'));
   assert.equal((await fetch(`${baseUrl}/markdown.js`)).status, 200);
+  for (const face of ['ibm-plex-sans-400', 'ibm-plex-sans-500', 'ibm-plex-mono-400', 'ibm-plex-mono-500']) {
+    const font = await fetch(`${baseUrl}/fonts/${face}.woff2`);
+    assert.equal(font.status, 200);
+    assert.equal(font.headers.get('content-type'), 'font/woff2');
+    assert((await font.arrayBuffer()).byteLength > 10_000);
+  }
+  assert.equal((await fetch(`${baseUrl}/fonts/missing.woff2`)).status, 404);
+  const styles = await (await fetch(`${baseUrl}/dashboard.css`)).text();
+  assert(!/https?:\/\//.test(styles), 'the stylesheet loads nothing from outside this machine');
   const script = await (await fetch(`${baseUrl}/dashboard.js`)).text();
   assert(script.includes('Copy command'));
   assert(script.includes('createActivityChart'));
