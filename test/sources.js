@@ -16,7 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CLI = path.join(__dirname, 'index.js');
+const CLI = path.join(__dirname, '..', 'index.js');
 const root = mkdtempSync(path.join(os.tmpdir(), 'sessions-dual-source-'));
 const claudeDir = path.join(root, 'claude');
 const codexDir = path.join(root, 'codex');

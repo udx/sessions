@@ -1,12 +1,5 @@
 # Development files
-test.js
-test-dual-source.js
-test-server.js
-test-markdown.js
-test-elastic.js
-test-local-search.js
-test-transcripts.js
-test-agents.js
+test/
 .git
 .github
 .gitignore

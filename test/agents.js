@@ -10,10 +10,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { agentTargets, applyBlock, guideText, instructionBlock, mentionsOutsideBlock, removeBlock } from './agents.js';
+import { agentTargets, applyBlock, guideText, instructionBlock, mentionsOutsideBlock, removeBlock } from '../lib/agents.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CLI = path.join(__dirname, 'index.js');
+const CLI = path.join(__dirname, '..', 'index.js');
 const root = mkdtempSync(path.join(os.tmpdir(), 'sessions-agents-'));
 
 let passed = 0;

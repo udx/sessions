@@ -37,7 +37,7 @@ const document = {
 };
 const sandbox = { document, URL, window: {} };
 vm.runInNewContext(
-  readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'markdown.js'), 'utf8'),
+  readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dashboard', 'markdown.js'), 'utf8'),
   sandbox
 );
 const render = sandbox.window.renderSessionMarkdown;

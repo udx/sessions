@@ -10,11 +10,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { compileQuery, fragmentsOf, searchFiles } from './local-search.js';
-import { HIGHLIGHT_CLOSE, HIGHLIGHT_OPEN } from './query.js';
+import { compileQuery, fragmentsOf, searchFiles } from '../lib/local-search.js';
+import { HIGHLIGHT_CLOSE, HIGHLIGHT_OPEN } from '../lib/query.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CLI = path.join(__dirname, 'index.js');
+const CLI = path.join(__dirname, '..', 'index.js');
 
 let passed = 0;
 let failed = 0;

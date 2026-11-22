@@ -10,9 +10,9 @@ import { spawn, spawnSync } from 'child_process';
 import zlib from 'zlib';
 import os from 'os';
 import { fileURLToPath } from 'url';
-import { displayUrl, isLoopbackUrl, isValidIndexName, loadConfig } from './config.js';
-import { HIGHLIGHT_OPEN, HIGHLIGHT_CLOSE } from './query.js';
-import { createFrameWatch } from './zstd-frames.js';
+import { displayUrl, isLoopbackUrl, isValidIndexName, loadConfig } from './lib/config.js';
+import { HIGHLIGHT_OPEN, HIGHLIGHT_CLOSE } from './lib/query.js';
+import { createFrameWatch } from './lib/zstd-frames.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(await fs.readFile(path.join(__dirname, 'package.json'), 'utf8'));
@@ -1618,7 +1618,7 @@ function hitSnippets(hit, query, mode) {
 // Answers a search from the Elasticsearch index. Returns the outcome, or a
 // sentence saying why the index could not answer.
 async function searchElastic(query, opts, config) {
-  const elastic = await import('./elastic.js');
+  const elastic = await import('./lib/elastic.js');
   const es = config.elasticsearch;
   const client = elastic.createClient({ ...es, timeoutMs: 20_000 });
   let snapshot = await elastic.currentSnapshot(client, es.index);
@@ -1732,7 +1732,7 @@ async function firstPrompts(session, count = 5) {
 
 // Answers a search by reading the session files, newest session first.
 async function searchLocal(query, opts) {
-  const { searchFiles } = await import('./local-search.js');
+  const { searchFiles } = await import('./lib/local-search.js');
   const limit = parseInt(opts.limit);
   let sessions = await getSessionFiles(opts.project, opts.source, { subagents: true });
   const since = sinceFromOptions(opts);
@@ -2008,7 +2008,7 @@ async function runSync(opts) {
     );
   }
 
-  const elastic = await import('./elastic.js');
+  const elastic = await import('./lib/elastic.js');
   const client = es.url ? elastic.createClient(es) : null;
 
   try {
@@ -2103,7 +2103,7 @@ async function requireIndex() {
   if (!es.url) {
     failWith('Labels are kept in the optional Elasticsearch index. Run "sessions sync" to set one up.');
   }
-  const elastic = await import('./elastic.js');
+  const elastic = await import('./lib/elastic.js');
   const client = elastic.createClient(es);
   const snapshot = await elastic.currentSnapshot(client, es.index);
   if (!snapshot) failWith(`Elasticsearch at ${client.url} has no "${es.index}" index yet (run "sessions sync")`);
@@ -2205,7 +2205,7 @@ const INIT_WORDS = {
 // Adds, updates or removes the managed note in each installed agent's global
 // instructions file.
 async function runInit(opts) {
-  const agents = await import('./agents.js');
+  const agents = await import('./lib/agents.js');
   if (opts.print) {
     process.stdout.write(agents.instructionBlock());
     return;
@@ -2312,7 +2312,7 @@ program
   .option('--active-minutes <minutes>', 'Consider sessions active for this long after updates', parseActiveMinutes, 15)
   .option('--open', 'Open the dashboard in your default browser')
   .action(async (opts) => {
-    const { startSessionServer } = await import('./server.js');
+    const { startSessionServer } = await import('./lib/server.js');
     await startSessionServer({ ...opts, getSessionFiles, getSessionMeta, streamSessionMessages, extractTextContent });
   });
 
@@ -2926,7 +2926,7 @@ program
   .command('guide')
   .description('Print a one-screen reference, written for the agents that use this tool')
   .action(async () => {
-    const { guideText } = await import('./agents.js');
+    const { guideText } = await import('./lib/agents.js');
     process.stdout.write(guideText());
   });
 

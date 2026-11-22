@@ -8,7 +8,7 @@
     "sessions": "index.js"
   },
   "scripts": {
-    "test": "node test.js && node test-dual-source.js && node test-server.js && node test-markdown.js && node test-elastic.js && node test-local-search.js && node test-transcripts.js && node test-agents.js"
+    "test": "node test/run.js"
   },
   "keywords": [
     "claude",

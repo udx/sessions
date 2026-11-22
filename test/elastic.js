@@ -6,7 +6,7 @@
 //   1. unit tests for config resolution, the query language, and documents
 //   2. CLI tests against an in-process fake Elasticsearch (always run)
 //   3. CLI tests against a real cluster, only when SESSIONS_TEST_ES_URL is set:
-//        SESSIONS_TEST_ES_URL=http://127.0.0.1:9220 node test-elastic.js
+//        SESSIONS_TEST_ES_URL=http://127.0.0.1:9220 node test/elastic.js
 //      They use their own index and remove it afterwards.
 
 import assert from 'node:assert/strict';
@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { isLoopbackUrl, isValidIndexName, loadConfig, normalizeBackend } from './config.js';
+import { isLoopbackUrl, isValidIndexName, loadConfig, normalizeBackend } from '../lib/config.js';
 import {
   CREATED_BY,
   HIGHLIGHT_CLOSE,
@@ -38,10 +38,10 @@ import {
   snapshotName,
   syncIndex,
   toolInputText
-} from './elastic.js';
+} from '../lib/elastic.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CLI = path.join(__dirname, 'index.js');
+const CLI = path.join(__dirname, '..', 'index.js');
 const root = mkdtempSync(path.join(os.tmpdir(), 'sessions-elastic-'));
 const claudeDir = path.join(root, 'claude');
 const codexDir = path.join(root, 'codex');

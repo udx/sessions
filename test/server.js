@@ -17,7 +17,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CLI = path.join(__dirname, 'index.js');
+const CLI = path.join(__dirname, '..', 'index.js');
 const root = mkdtempSync(path.join(os.tmpdir(), 'sessions-server-'));
 const claudeDir = path.join(root, 'claude');
 const codexDir = path.join(root, 'codex');
@@ -218,9 +218,9 @@ try {
   console.log('  ✓ dashboard assets and refresh behavior are served');
 
   assert.equal((await fetch(`${baseUrl}/api/insights`)).status, 404);
-  const packedFiles = ['dashboard.html', 'dashboard.css', 'dashboard.js', 'markdown.js', 'server.js'];
+  const packedFiles = ['dashboard/dashboard.html', 'dashboard/dashboard.css', 'dashboard/dashboard.js', 'dashboard/markdown.js', 'lib/server.js'];
   for (const file of packedFiles) {
-    assert(readFileSync(path.join(__dirname, file), 'utf8').length > 0);
+    assert(readFileSync(path.join(__dirname, '..', file), 'utf8').length > 0);
   }
   console.log('  ✓ local-only server exposes only the packaged dashboard assets');
 

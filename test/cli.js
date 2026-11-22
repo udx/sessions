@@ -11,7 +11,7 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CLI = `node ${path.join(__dirname, 'index.js')}`;
+const CLI = `node ${path.join(__dirname, '..', 'index.js')}`;
 const root = mkdtempSync(path.join(os.tmpdir(), 'sessions-cli-'));
 const claudeDir = path.join(root, 'claude');
 const now = Date.now();
