@@ -15,6 +15,7 @@ Search works out of the box by reading the transcript files. Point it at an Elas
 | Source | Sessions | Prompt history |
 |--------|----------|----------------|
 | Claude Code | `~/.claude/projects/`, including subagent transcripts | `~/.claude/history.jsonl` |
+| Claude desktop app | Code tab: `~/.claude/projects/`, with the titles the app shows. Cowork: the app's own data folder | |
 | Codex | `~/.codex/sessions/` and `~/.codex/archived_sessions/`, plain or compressed | `~/.codex/history.jsonl` |
 | Kimi Code | `~/.kimi-code/sessions/` and `~/.kimi/sessions/` (legacy) | `~/.kimi-code/user-history/` and `~/.kimi/user-history/` |
 
@@ -71,6 +72,8 @@ sessions list --subagents
 
 Claude subagent transcripts are left out of listings unless you pass `--subagents`. Search always reads them.
 
+A session that has a name is listed by it, with the prompt it began with beside it. Names come from the Claude desktop app, from Kimi Code, and from `/rename` in Claude Code. A subagent is listed with what it was asked to do, which is a description and not a name. Sessions of the desktop app are marked `(desktop)`, or `(desktop cowork)` for the Cowork tab.
+
 ### Search transcripts
 
 ```bash
@@ -105,6 +108,15 @@ sessions show a1b2c3d4 --around 0                 # read the conversation there
 ```
 
 When nothing matches every term in one message, the search loosens one step at a time and says which step answered: tool calls (commands, file paths, arguments), then the terms spread across one session, then the messages that contain most of them. `--literal` turns all of that off and matches the query as one exact substring.
+
+A session is also found by its name. The name is how you know a session in the app that ran it, and often nobody said it in the session, so a search for it would otherwise come back empty. Such a match is shown as `title` where a speaker would be, at position `#0`:
+
+```text
+c9d8e7f6 [claude] /work/shop-api (desktop) title 3 hours ago #0
+    Checkout timeout investigation
+```
+
+The name speaks only for a session none of whose messages match: a session that a message brings up is listed once, for that message. With an index, up to three sessions found by name come first and are counted with the rest. When more than one row is asked for, at least one stays with the messages that matched; with `-n 1` the name is the answer.
 
 Other filters: `--role user` or `--role assistant` for who said it, `--tool Bash` for messages that called a tool, `-C 2` to print the neighboring messages, labeled `[you]`, `[claude]`, `[codex]`, or `[kimi]`. Matches inside a Claude subagent's transcript are marked `(subagent of <session>)`.
 
@@ -223,13 +235,13 @@ sessions sync --prune              # drop sessions whose transcript is gone
 sessions sync --drop               # delete the index
 ```
 
-Sync is incremental. It compares each transcript's size and modification time with what was indexed, re-reads the ones that changed, and merges its own fields into the existing documents. A typical run takes a second or two. It records its progress as it goes, so a run that is interrupted keeps the sessions it finished and the next one carries on from there.
+Sync is incremental. It compares each transcript's size and modification time with what was indexed, along with the session's name and whether the desktop app knows it (both can change without the transcript changing), re-reads the ones that changed, and merges its own fields into the existing documents. A typical run takes a second or two. It records its progress as it goes, so a run that is interrupted keeps the sessions it finished and the next one carries on from there.
 
-With `auto_sync` set, a search does this first whenever the last sync is older than that many minutes. It reads at most `auto_sync_max_mb` of transcript, newest sessions first, and leaves what does not fit for the next search or for `sessions sync`, ending with what is waiting, for example `3 sessions (2.4 GB) not indexed yet, run "sessions sync"`.
+With `auto_sync` set, a search does this first whenever the last sync is older than that many minutes. It reads at most `auto_sync_max_mb` of transcript, newest sessions first, and leaves what does not fit for a later search or for `sessions sync`. Until that is read, every search ends with what is waiting, for example `3 sessions (2.4 GB) not indexed yet, run "sessions sync"`.
 
 Search reflects the last sync, and every result ends with how long ago that was.
 
-The index is named `<index>-YYYYMMDD-HHMMSS` behind the `<index>` alias. `--rebuild` writes a new one and swaps the alias when it is complete, so searches keep working throughout; it happens automatically when a new version of Sessions changes the index format. Sessions whose transcript was deleted stay searchable until you `--prune`.
+The index is named `<index>-YYYYMMDD-HHMMSS` behind the `<index>` alias. `--rebuild` writes a new one and swaps the alias when it is complete, so searches keep working throughout; it happens automatically when a new version of Sessions changes the index format. Sessions whose transcript was deleted stay searchable until you `--prune`. Pruning is refused while a folder that holds sessions is there and cannot be read, because the sessions in it would look deleted. The folder is named on stderr.
 
 ### What the index adds
 
@@ -330,7 +342,7 @@ The `--json` flag on `list` includes a `display` field (the first user prompt) f
 sessions list -n 5 --json | jq '.[].display'
 ```
 
-Search returns one object per match, best session first: `sessionId`, `shortId`, `source`, `project`, `timestamp`, `type` (`user` or `assistant`), `snippets`, `matchesInSession`, `seq` (the message position, for `show --around` and `label --message`), `tools`, and `matchMode`, which says how the query was matched: `smart`, `literal`, `tools`, `session`, or `partial`, plus `prefix` and `fuzzy` with an index. `contextMessages` holds `type`, `text`, and `position` when using `-C`. `injected: true` marks text that a tool recorded under the user role, such as a task notification, and `subagent: true` with `parentSessionId` marks a match in a subagent's transcript.
+Search returns one object per match, best session first: `sessionId`, `shortId`, `source`, `project`, `timestamp`, `type` (`user` or `assistant`), `snippets`, `matchesInSession`, `seq` (the message position, for `show --around` and `label --message`), `tools`, and `matchMode`, which says how the query was matched: `smart`, `literal`, `tools`, `session`, or `partial`, plus `prefix` and `fuzzy` with an index. `contextMessages` holds `type`, `text`, and `position` when using `-C`. `injected: true` marks text that a tool recorded under the user role, such as a task notification, and `subagent: true` with `parentSessionId` marks a match in a subagent's transcript. A session found by its name has `type: "title"` and the name in `title`. Sessions of the Claude desktop app carry `app: "desktop"` and `desktopKind` (`code`, `cowork`, `chat` or `scheduled`), in `list --json` as well. In `list --json` a session that has a name carries it in `title` with `named: true`; a subagent's `title` is what it was asked to do.
 
 Results from an index add `score`, and `sessionLabels` and `labels` when something is labeled.
 
@@ -356,6 +368,16 @@ Developed and tested against Elasticsearch 8.19, using only features available s
 
 Codex CLI and desktop app sessions are both supported. Codex appends active sessions under date-based directories and compresses finished ones to `.jsonl.zst` after a few days. Sessions scans those directories recursively and reads both forms. Compressed rollouts need Node 22.15 or newer, or the `zstd` command on your path; without either they are skipped with a notice. It filters internal/developer messages and collapses Codex's adjacent event/response duplicates. Desktop Page context and plugin recommendations are excluded from prompts and search; actual user replies are retained. For sessions absent from `history.jsonl` (including desktop chats), `history` reads user prompts from the transcripts. Existing global history remains authoritative for sessions it contains.
 
+The Claude desktop app runs Claude Code underneath, so its sessions are ordinary Claude Code transcripts; what differs is where they are kept and what the app knows about them.
+
+- **Code tab.** The transcript is where the terminal CLI would put it, under `~/.claude/projects/`. The app keeps a record of each session in `claude-code-sessions/` inside its data folder, which is where the title it shows and the archived state come from.
+- **Cowork tab.** Each session has a storage folder of its own inside the app's data folder, `local-agent-mode-sessions/<account>/<org>/<session>/`, with the transcript under `.claude/projects/` inside it. Sessions reads those folders too, so Cowork sessions are listed, shown, searched and indexed with the rest. A Cowork session runs in a sandbox, so it is listed under the folder you gave it rather than the sandbox path. Its title belongs to the session's own transcript; any other transcript in the same storage folder is listed without one.
+- **Chat tab.** Chats are kept by claude.ai, not on your machine, and are not read.
+
+A Claude session's name is the title the desktop app shows for it. Without one, it is the name Claude Code holds: `/rename` and the app write it into the transcript, and Claude Code keeps the current one within the last 64 KB of the file, which is where its own session list looks first. It also keeps the name in `custom-title.json` beside the transcript, and its list falls back to that and then to the first 64 KB. Sessions reads the same three places in the same order, so a session has here the name it has there, a name costs no read of the whole transcript, and every listing, search and sync knows it.
+
+The app's data folder is `~/Library/Application Support/Claude` on macOS and `~/.config/Claude` on Linux. On Windows it is `%APPDATA%\Claude`, or `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude` for the build from the Microsoft Store; both are read. `SESSIONS_CLAUDE_DESKTOP_DIR` names another one, and setting it to nothing turns the desktop app off. When `SESSIONS_CLAUDE_DIR` moves the Claude directory, the app's data is only read if it is named too. The app remembers sessions whose transcript is no longer on disk; those have nothing to read and are left out. A folder of the app that cannot be read is named once on stderr and its sessions are left out; nothing else stops. Tested on macOS: the Cowork layout and the Windows locations follow the app's own code.
+
 Claude Code keeps what a subagent did in its own transcript, under `<project>/<session-id>/subagents/`, including the agents a workflow runs. Search reads those, `show` and `export` open them by ID, and `sync` indexes them; listings leave them out unless asked. What a subagent was told is shown as coming from its parent agent, not from you.
 
 Claude Code deletes transcripts after 30 days unless `cleanupPeriodDays` in `~/.claude/settings.json` says otherwise, and a deleted transcript can no longer be read. An Elasticsearch index keeps what it has already indexed until you run `sessions sync --prune`.
@@ -364,8 +386,13 @@ Kimi Code sessions come in two on-disk generations, and both are read. Modern se
 
 ## Changelog
 
-### Unreleased
-- A search with `auto_sync` now indexes the newest sessions that fit in `auto_sync_max_mb` and leaves only the rest. In 1.11.0 it indexed nothing at all once the total waiting passed the limit, so one large session that kept changing stopped every other session from being indexed. The default limit is now 1024
+### 1.12.0
+- Sessions of the Claude desktop app are read. Cowork sessions, which the app keeps in its own data folder, are listed, shown, searched and indexed with the rest. Code tab sessions were already read; they now carry the title the app shows and its archived state, and both kinds are marked `(desktop)`
+- A session is listed by its name when it has one, and a search finds it by that name, with a match of type `title`, when none of its messages match. Names come from the desktop app, from Kimi Code and from `/rename`; Claude Code's are read from the places its own session list reads them, so no listing has to read a whole transcript for one. Kimi titles were read before but never shown in `list`
+- Sync reads a session again when its name, or what the desktop app knows about it, changed since it was indexed, even if its transcript did not
+- A session folder that is there and cannot be read is named on stderr instead of being passed over in silence, and `sync --prune` is refused while there is one, since the sessions in it would look deleted
+- The package is laid out in folders: the modules in `lib/`, the dashboard's files in `dashboard/`, the tests in `test/` with one runner, `node test/run.js`
+- A search with `auto_sync` now indexes the newest sessions that fit in `auto_sync_max_mb` and leaves only the rest. In 1.11.0 it indexed nothing at all once the total waiting passed the limit, so one large session that kept changing stopped every other session from being indexed. Searches keep saying what is still waiting until it is read. The default limit is now 1024
 - The dashboard is laid out as a tool: a rail on the left filters by agent and project with counts, and sessions are listed in a dense table, about three times as many per screen. Agents are named the way the command line prints them (`[claude]`, `[codex]`, `[kimi]`). The typefaces ship with the tool, so the page still loads nothing from outside your machine
 - A compressed Codex session that was cut off is reported on Node 22 as well. That version's built-in decoder ends such a file without an error, so the tool now follows the archive's frames itself
 
@@ -465,6 +492,23 @@ Claude Code stores each session under `~/.claude/projects/<encoded-project>/`. C
 ## Source and history
 
 `sessions` is built at [UDX](https://udx.io). It is developed in a private repository and published to [github.com/udx/sessions](https://github.com/udx/sessions) commit by commit, each with its own date, by the UDX robot account. Every version tag there is the exact source of the package npm serves for that version. 1.5.0 has no tag: it was published from a tree that was never committed, and 1.5.1 replaced it the same day.
+
+## Development
+
+```text
+index.js      the command line: every command, and the readers for each agent's transcripts
+lib/          search without an index, the Elasticsearch backend, the desktop app, onboarding, config
+dashboard/    the page "sessions serve" shows, and its fonts
+test/         one script per area, and run.js to run them
+```
+
+```bash
+npm test                         # every suite
+node test/run.js search desktop  # only some
+SESSIONS_TEST_ES_URL=http://127.0.0.1:9220 node test/elastic.js   # also against a real Elasticsearch
+```
+
+The tests write their own transcripts to a temporary folder and never read yours. The last command creates and removes an index of its own, named `sessions-test-<pid>`.
 
 ## License
 

@@ -17,6 +17,7 @@ const SUITES = {
   cli: 'every command against a few transcripts',
   sources: 'reading Claude Code, Codex and Kimi sessions',
   transcripts: 'subagents, compressed rollouts, damaged files',
+  desktop: 'sessions of the Claude desktop app',
   search: 'search without an index',
   elastic: 'the Elasticsearch index, sync and search',
   agents: 'sessions init, sessions guide, and what they claim',

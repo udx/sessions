@@ -1,6 +1,6 @@
 {
   "name": "@udx/sessions",
-  "version": "1.11.0",
+  "version": "1.12.0",
   "description": "Search, browse, export, and monitor Claude Code, Codex, and Kimi sessions from the CLI or a local dashboard. Built for agents to recall and hand off work, with optional Elasticsearch-backed search.",
   "main": "index.js",
   "type": "module",

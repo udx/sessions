@@ -12,6 +12,7 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import { displayUrl, isLoopbackUrl, isValidIndexName, loadConfig } from './lib/config.js';
 import { HIGHLIGHT_OPEN, HIGHLIGHT_CLOSE } from './lib/query.js';
+import { desktopDataDirs, desktopNote, findCoworkSessions, readCodeRecords } from './lib/desktop.js';
 import { createFrameWatch } from './lib/zstd-frames.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -348,51 +349,203 @@ function isUnusedCodexLine(lineStart) {
   return false;
 }
 
-async function resolveClaudeProjectPath(encodedDir) {
-  const projectDir = path.join(PROJECTS_DIR, encodedDir);
+async function resolveClaudeProjectPath(projectDir) {
   const files = await fs.readdir(projectDir);
   const firstSession = files.find(f => f.endsWith('.jsonl'));
-  if (!firstSession) return encodedDir;
+  if (!firstSession) return null;
 
   let cwd = null;
   await streamLines(path.join(projectDir, firstSession), (data) => {
     if (data.cwd) { cwd = data.cwd; return true; }
   });
-  return cwd || encodedDir;
+  return cwd;
 }
 
-async function getClaudeProjects() {
-  if (!existsSync(PROJECTS_DIR)) return [];
-  const entries = await fs.readdir(PROJECTS_DIR);
-  const projects = [];
+// Places sessions are kept in that are there and could not be looked at.
+// Sessions in them are missing from whatever a command answers, so each is
+// named once on stderr, and a sync does not prune while there is one: a
+// session that could not be seen is not a session that was deleted.
+const unreadableFolders = new Map();
+function noteUnreadableFolder(target, reason) {
+  if (unreadableFolders.has(target)) return;
+  unreadableFolders.set(target, reason);
+  console.error(c.yellow(`Could not read ${tildePath(target)} (${reason}); sessions there are left out.`));
+}
+const isAbsent = error => error.code === 'ENOENT' || error.code === 'ENOTDIR';
 
+// stat and readdir for discovery. "Not there" is an answer and says nothing.
+// Anything else that goes wrong is noted (see above) and reads as absent.
+async function statNoting(target) {
+  try {
+    return await fs.stat(target);
+  } catch (error) {
+    if (!isAbsent(error)) noteUnreadableFolder(target, error.code || error.message);
+    return null;
+  }
+}
+async function listNoting(dir, options) {
+  try {
+    return await fs.readdir(dir, options);
+  } catch (error) {
+    if (!isAbsent(error)) noteUnreadableFolder(dir, error.code || error.message);
+    return [];
+  }
+}
+
+// Lists a folder Claude sessions are read from. In Claude Code's own folders
+// a failed listing stops the command, as it always has. A folder of the
+// desktop app that cannot be listed is noted and skipped.
+function listSessionFolder(dir, ofApp) {
+  return ofApp ? listNoting(dir) : fs.readdir(dir);
+}
+
+// What the Claude desktop app knows about its sessions: a record for each
+// Code tab session, keyed by transcript, and the storage folder of each
+// Cowork session. Kept for a few seconds, so one command reads it once and
+// the dashboard, which runs for hours, still sees what the app does next.
+const DESKTOP_STATE_MS = 5_000;
+let desktopState = null;
+async function desktopSessions() {
+  if (desktopState && Date.now() - desktopState.readAt < DESKTOP_STATE_MS) return desktopState;
+  const code = new Map();
+  const storage = new Map();
+  let visible = false;
+  for (const dataDir of desktopDataDirs()) {
+    if (!existsSync(dataDir)) continue;
+    visible = true;
+    const problems = [];
+    for (const [transcriptId, record] of await readCodeRecords(dataDir, problems)) {
+      const known = code.get(transcriptId);
+      if (!known || (record.lastActivityAt || 0) >= (known.lastActivityAt || 0)) code.set(transcriptId, record);
+    }
+    // On Windows the app has two places for its data and can move between
+    // them. A session kept in both is one session: the copy last active.
+    for (const found of await findCoworkSessions(dataDir, problems)) {
+      const key = path.basename(found.storageDir);
+      const known = storage.get(key);
+      if (!known || (found.record.lastActivityAt || 0) > (known.record.lastActivityAt || 0)) storage.set(key, found);
+    }
+    for (const problem of problems) noteUnreadableFolder(problem.path, problem.reason);
+  }
+  // `visible`: whether this run can see the app's data at all. One that
+  // cannot has nothing to say about which sessions the app knows.
+  desktopState = { readAt: Date.now(), code, cowork: [...storage.values()], visible };
+  return desktopState;
+}
+
+// The project folders under one "projects" directory. `desktop` is the
+// Cowork session that directory belongs to, when it is one's private copy.
+async function claudeProjectsIn(projectsDir, desktop = null) {
+  const projects = [];
+  const ofApp = desktop !== null;
+  const entries = await listSessionFolder(projectsDir, ofApp);
   for (const entry of entries) {
-    const projectDir = path.join(PROJECTS_DIR, entry);
-    const stat = await fs.stat(projectDir).catch(() => null);
+    const projectDir = path.join(projectsDir, entry);
+    const stat = await statNoting(projectDir);
     if (!stat || !stat.isDirectory()) continue;
 
-    const files = await fs.readdir(projectDir);
+    const files = await listSessionFolder(projectDir, ofApp);
     const sessionFiles = files.filter(f => f.endsWith('.jsonl'));
     if (sessionFiles.length === 0) continue;
 
     let totalSize = 0;
     for (const file of sessionFiles) {
-      const s = await fs.stat(path.join(projectDir, file)).catch(() => null);
+      const s = await statNoting(path.join(projectDir, file));
       if (s) totalSize += s.size;
     }
 
-    const decoded = await resolveClaudeProjectPath(entry);
+    // A Cowork session works inside a sandbox, so the folder the person gave
+    // it says more than the path it ran in.
+    const decoded = desktop?.folders[0] || await resolveClaudeProjectPath(projectDir) || desktop?.cwd || entry;
 
     projects.push({
       encoded: entry,
       path: decoded,
       source: 'claude',
       sessionCount: sessionFiles.length,
-      totalSize
+      totalSize,
+      dir: projectDir,
+      desktop
     });
   }
+  return projects;
+}
 
+// Projects of the Claude Code CLI, then those inside the desktop app's
+// Cowork sessions, which keep their transcripts in folders of their own.
+async function getClaudeProjects() {
+  const projects = existsSync(PROJECTS_DIR) ? await claudeProjectsIn(PROJECTS_DIR) : [];
+  for (const cowork of (await desktopSessions()).cowork) {
+    const inside = await claudeProjectsIn(cowork.projectsDir, cowork.record);
+    // A record that does not say which transcript is its own can only speak
+    // for a storage folder that holds a single one.
+    const transcripts = inside.reduce((sum, project) => sum + project.sessionCount, 0);
+    for (const project of inside) project.desktopSole = transcripts === 1;
+    projects.push(...inside);
+  }
   return projects.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+// The name Claude Code holds for a session. /rename and the desktop app
+// write it into the transcript as a "custom-title" record, and Claude Code
+// keeps appending the current one so that it stays within the last 64 KB of
+// the file, which is where its own session list looks for it. It also keeps
+// the name in a small file beside the transcript, and its list falls back to
+// that and then to the first 64 KB. This reads the same three places in the
+// same order, so a session has here the name it has there, and knowing it
+// never takes reading a whole transcript.
+const NAME_WINDOW = 64 * 1024;
+const NAME_RECORD = Buffer.from('"custom-title"');
+
+// The latest name among the complete records in a stretch of a transcript.
+function latestName(buffer, length) {
+  let before = length;
+  while (before > 0) {
+    const at = buffer.lastIndexOf(NAME_RECORD, before - 1);
+    if (at === -1) return null;
+    const lineStart = buffer.lastIndexOf(10, at) + 1;
+    const newline = buffer.indexOf(10, at);
+    const lineEnd = newline === -1 || newline > length ? length : newline;
+    try {
+      const record = JSON.parse(buffer.toString('utf8', lineStart, lineEnd));
+      if (record?.type === 'custom-title' && typeof record.customTitle === 'string' && record.customTitle.trim()) {
+        return record.customTitle.trim();
+      }
+    } catch {}
+    before = lineStart;
+  }
+  return null;
+}
+
+async function claudeSessionName(filePath, size) {
+  let handle;
+  try {
+    handle = await fs.open(filePath, 'r');
+  } catch {
+    return null;
+  }
+  try {
+    const length = Math.min(size, NAME_WINDOW);
+    const stretch = Buffer.allocUnsafe(length);
+    const end = await handle.read(stretch, 0, length, size - length);
+    const atEnd = latestName(stretch, end.bytesRead);
+    if (atEnd) return atEnd;
+
+    try {
+      const beside = path.join(filePath.slice(0, -'.jsonl'.length), 'custom-title.json');
+      const kept = JSON.parse(await fs.readFile(beside, 'utf8'));
+      if (typeof kept?.customTitle === 'string' && kept.customTitle.trim()) return kept.customTitle.trim();
+    } catch {}
+
+    // A file no longer than the window has been read whole already.
+    if (size <= NAME_WINDOW) return null;
+    const start = await handle.read(stretch, 0, length, 0);
+    return latestName(stretch, start.bytesRead);
+  } catch {
+    return null;
+  } finally {
+    await handle.close().catch(() => {});
+  }
 }
 
 function makeShortId(source, sessionId) {
@@ -407,13 +560,13 @@ function makeShortId(source, sessionId) {
 // They are searchable and can be shown, but stay out of session listings.
 async function getClaudeSubagentFiles(projectDir, project) {
   const found = [];
-  const entries = await fs.readdir(projectDir, { withFileTypes: true }).catch(() => []);
+  const entries = await listNoting(projectDir, { withFileTypes: true });
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const pending = [path.join(projectDir, entry.name, 'subagents')];
     while (pending.length > 0) {
       const dir = pending.pop();
-      const items = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+      const items = await listNoting(dir, { withFileTypes: true });
       for (const item of items) {
         const fullPath = path.join(dir, item.name);
         if (item.isDirectory()) {
@@ -422,7 +575,7 @@ async function getClaudeSubagentFiles(projectDir, project) {
         }
         const match = item.isFile() ? item.name.match(/^agent-([A-Za-z0-9_-]+)\.jsonl$/) : null;
         if (!match) continue;
-        const stat = await fs.stat(fullPath).catch(() => null);
+        const stat = await statNoting(fullPath);
         if (!stat) continue;
         let meta = {};
         try {
@@ -450,6 +603,7 @@ async function getClaudeSubagentFiles(projectDir, project) {
 
 async function getClaudeSessionFiles(projectFilter = null, { subagents = false } = {}) {
   const projects = await getClaudeProjects();
+  const codeRecords = (await desktopSessions()).code;
   const sessions = [];
   const agents = new Map();
 
@@ -461,17 +615,17 @@ async function getClaudeSessionFiles(projectFilter = null, { subagents = false }
       if (!matchesDecoded && !matchesEncoded) continue;
     }
 
-    const projectDir = path.join(PROJECTS_DIR, project.encoded);
-    const files = await fs.readdir(projectDir);
+    const projectDir = project.dir;
+    const files = await listSessionFolder(projectDir, Boolean(project.desktop));
     const sessionFiles = files.filter(f => f.endsWith('.jsonl'));
 
     for (const file of sessionFiles) {
       const sessionId = file.replace('.jsonl', '');
       const filePath = path.join(projectDir, file);
-      const stat = await fs.stat(filePath).catch(() => null);
+      const stat = await statNoting(filePath);
       if (!stat) continue;
 
-      sessions.push({
+      const session = {
         sessionId,
         shortId: makeShortId('claude', sessionId),
         source: 'claude',
@@ -480,7 +634,27 @@ async function getClaudeSessionFiles(projectFilter = null, { subagents = false }
         filePath,
         size: stat.size,
         modifiedAt: stat.mtime
-      });
+      };
+      // A session of the desktop app carries what the app knows about it:
+      // which tab it belongs to and whether it is archived.
+      const desktop = project.desktop || codeRecords.get(sessionId);
+      if (desktop) {
+        session.app = 'desktop';
+        session.desktopKind = desktop.kind;
+        if (desktop.archived) session.archived = true;
+      }
+      // Its name is the one the app shows. A Cowork record names only the
+      // session's own transcript, not every transcript in its storage folder.
+      // Failing that, the name Claude Code holds for the session.
+      const own = !project.desktop
+        ? desktop
+        : desktop.transcriptId ? (desktop.transcriptId === sessionId ? desktop : null) : (project.desktopSole ? desktop : null);
+      const name = own?.title || await claudeSessionName(filePath, stat.size);
+      if (name) {
+        session.title = name;
+        session.named = true;
+      }
+      sessions.push(session);
     }
 
     if (subagents) {
@@ -503,7 +677,7 @@ async function findJsonlFiles(rootDir) {
 
   while (pending.length > 0) {
     const dir = pending.pop();
-    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+    const entries = await listNoting(dir, { withFileTypes: true });
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) pending.push(fullPath);
@@ -657,19 +831,19 @@ async function getKimiSessionDescriptors() {
     const sessionsRoot = path.join(root, 'sessions');
     if (!existsSync(sessionsRoot)) continue;
     const legacyWorkDirs = await getKimiLegacyWorkDirMap(root);
-    const buckets = await fs.readdir(sessionsRoot).catch(() => []);
+    const buckets = await listNoting(sessionsRoot);
 
     for (const bucket of buckets) {
       const bucketDir = path.join(sessionsRoot, bucket);
-      const bucketStat = await fs.stat(bucketDir).catch(() => null);
+      const bucketStat = await statNoting(bucketDir);
       if (!bucketStat || !bucketStat.isDirectory()) continue;
       const isModern = bucket.startsWith('wd_');
       let legacyProject = null;
-      const entries = await fs.readdir(bucketDir).catch(() => []);
+      const entries = await listNoting(bucketDir);
 
       for (const entry of entries) {
         const sessionDir = path.join(bucketDir, entry);
-        const sessionStat = await fs.stat(sessionDir).catch(() => null);
+        const sessionStat = await statNoting(sessionDir);
         if (!sessionStat || !sessionStat.isDirectory()) continue;
 
         let sessionId;
@@ -687,7 +861,7 @@ async function getKimiSessionDescriptors() {
           try {
             const state = JSON.parse(await fs.readFile(path.join(sessionDir, 'state.json'), 'utf8'));
             project = state.workDir || state.cwd || null;
-            title = state.title || null;
+            title = typeof state.title === 'string' && state.title.trim() ? state.title.trim() : null;
             startedAt = kimiTimestamp(state.createdAt) || null;
             archived = state.archived === true;
           } catch {}
@@ -702,7 +876,7 @@ async function getKimiSessionDescriptors() {
           continue;
         }
 
-        const stat = await fs.stat(transcriptPath).catch(() => null);
+        const stat = await statNoting(transcriptPath);
         if (!stat || !stat.isFile()) continue;
 
         descriptors.push({
@@ -714,6 +888,7 @@ async function getKimiSessionDescriptors() {
           filePath: transcriptPath,
           format,
           title,
+          ...(title ? { named: true } : {}),
           startedAt,
           archived,
           size: stat.size,
@@ -903,8 +1078,28 @@ async function getAllProjects(source = 'all') {
   const codexSessions = include('codex') ? await getCodexSessionFiles() : [];
   const kimiSessions = include('kimi') ? await getKimiSessionFiles() : [];
 
+  // Several Cowork sessions can have worked in one folder, and each keeps
+  // its transcripts apart: they count as one project. What discovery needs
+  // to find its way around (dir, desktop) stays out of what is reported.
+  const claudeByPath = new Map();
+  for (const project of claudeProjects) {
+    const known = claudeByPath.get(project.path);
+    if (known) {
+      known.sessionCount += project.sessionCount;
+      known.totalSize += project.totalSize;
+    } else {
+      claudeByPath.set(project.path, {
+        encoded: project.encoded,
+        path: project.path,
+        source: project.source,
+        sessionCount: project.sessionCount,
+        totalSize: project.totalSize
+      });
+    }
+  }
+
   const combined = [
-    ...claudeProjects,
+    ...claudeByPath.values(),
     ...aggregateSessionsByProject(codexSessions, 'codex'),
     ...aggregateSessionsByProject(kimiSessions, 'kimi')
   ];
@@ -1401,6 +1596,7 @@ function literalSnippets(text, query) {
 // "you" is reserved for what the user typed; text a tool injected under the
 // user role (notifications, command output) reads as "system".
 function speakerTag(r) {
+  if (r.type === 'title') return c.dim('title');
   if (r.injected) return c.dim('system');
   return r.type === 'user' ? c.cyan('you') : c.green(r.source);
 }
@@ -1420,6 +1616,17 @@ function subagentHeader(session) {
   ];
 }
 
+const DESKTOP_TABS = { code: 'Code tab', cowork: 'Cowork', chat: 'Cowork chat', scheduled: 'Cowork scheduled task' };
+
+// Header lines for what is known about a session beyond its transcript: the
+// name it was given, the app it ran in, the session a subagent worked for.
+function sessionHeader(session) {
+  const lines = subagentHeader(session);
+  if (session.title && !session.subagent) lines.push(`Title: ${session.title}`);
+  if (session.app === 'desktop') lines.push(`App: Claude desktop (${DESKTOP_TABS[session.desktopKind] || session.desktopKind || 'session'})`);
+  return lines;
+}
+
 function printSearchMatch(r, totalInSession) {
   const time = r.timestamp ? formatRelativeTime(r.timestamp) : '';
   const who = speakerTag(r);
@@ -1431,6 +1638,7 @@ function printSearchMatch(r, totalInSession) {
     sourceTag(r.source) + ' ' +
     c.dim(r.project) + ' ' +
     (r.subagent ? c.dim(`${subagentNote(r.parentSessionId)} `) : '') +
+    (r.app ? c.dim(`${desktopNote(r)} `) : '') +
     who + ' ' +
     c.dim(time) +
     position +
@@ -1488,8 +1696,10 @@ function snapshotFooter(snapshot) {
   const synced = snapshot.syncedAt ? formatRelativeTime(snapshot.syncedAt) : 'at an unknown time';
   const ageMs = snapshot.syncedAt ? Date.now() - snapshot.syncedAt.getTime() : Infinity;
   let hint = ageMs > 60 * 60_000 ? '; run "sessions sync" to include newer messages' : '';
-  if (snapshot.backlog) {
-    hint = `; ${plural(snapshot.backlog.sessions, 'session')} (${formatSize(snapshot.backlog.bytes)}) not indexed yet, run "sessions sync"`;
+  // Counted just now, or left by the last sync and kept with its record.
+  const backlog = snapshot.backlog || snapshot.meta?.last_sync?.left;
+  if (backlog?.sessions > 0) {
+    hint = `; ${plural(backlog.sessions, 'session')} (${formatSize(backlog.bytes)}) not indexed yet, run "sessions sync"`;
   }
   return `Elasticsearch index synced ${synced}${hint}`;
 }
@@ -1530,7 +1740,8 @@ async function refreshIfStale(elastic, client, config, snapshot) {
   if (!isLoopbackUrl(es.url) && !es.allowRemote) return snapshot;
   try {
     const everything = await getSessionFiles(null, 'all', { subagents: true });
-    const waiting = elastic.pendingSessions(everything, await elastic.indexedSessions(client, snapshot.index));
+    const appVisible = (await desktopSessions()).visible;
+    const waiting = elastic.pendingSessions(everything, await elastic.indexedSessions(client, snapshot.index), { appVisible });
     const budget = es.autoSyncMaxMb * 1024 * 1024;
     const taken = [];
     const left = [];
@@ -1545,6 +1756,7 @@ async function refreshIfStale(elastic, client, config, snapshot) {
       }
     }
 
+    const backlog = { sessions: left.length, bytes: left.reduce((sum, session) => sum + (session.size || 0), 0) };
     let refreshed = snapshot;
     if (taken.length > 0 || waiting.length === 0) {
       await elastic.syncIndex({
@@ -1555,12 +1767,16 @@ async function refreshIfStale(elastic, client, config, snapshot) {
         allSessionKeys: everything.map(sessionKey),
         reader: { streamSessionMessages, extractTextContent, isDisplayPrompt },
         scope: { source: 'all', project: null, since: null },
-        toolVersion: pkg.version
+        toolVersion: pkg.version,
+        appVisible,
+        // Kept with the sync's record: the searches that follow within the
+        // auto_sync interval do not count again, and still have to say it.
+        left: backlog
       });
       refreshed = (await elastic.currentSnapshot(client, es.index)) || snapshot;
     }
     if (left.length === 0) return refreshed;
-    return { ...refreshed, backlog: { sessions: left.length, bytes: left.reduce((sum, session) => sum + (session.size || 0), 0) } };
+    return { ...refreshed, backlog };
   } catch (error) {
     if (error.name !== 'ElasticError') throw error;
     console.error(c.dim(`Could not refresh the index (${error.message}); results are as of the last sync.`));
@@ -1665,6 +1881,19 @@ async function searchElastic(query, opts, config) {
     }
   });
 
+  // A session whose name holds every term is an outright match, so messages
+  // that only matched once the search had loosened give way to it. That is
+  // also what the file scan does.
+  const titles = result.titles || [];
+  const byName = titles.length > 0 && result.mode !== 'smart' && result.mode !== 'literal';
+  if (byName) {
+    result.mode = 'smart';
+    result.groups = [];
+    result.totalMessages = 0;
+    result.totalSessions = 0;
+    result.facets = null;
+  }
+
   // -n caps the matches shown. Sessions come best first and each contributes
   // up to --per-session matches.
   const hits = result.groups.flatMap(group => group.hits.map(hit => ({ hit, group }))).slice(0, limit);
@@ -1697,6 +1926,10 @@ async function searchElastic(query, opts, config) {
       row.subagent = true;
       row.parentSessionId = hit.parentSessionId;
     }
+    if (hit.app) {
+      row.app = hit.app;
+      row.desktopKind = hit.desktopKind;
+    }
     // Label fields appear only when something is labeled.
     const ofSession = sessionLabels.get(hit.sessionKey);
     if (ofSession) row.sessionLabels = ofSession;
@@ -1704,11 +1937,42 @@ async function searchElastic(query, opts, config) {
     return row;
   });
 
+  // Sessions the query names, and no message of which matched, come first.
+  // They are few, and a name that matches is rarely an accident. When more
+  // than one row is asked for, at least one stays with the messages that
+  // matched; with a single row, the name is the answer.
+  const room = rows.length === 0 ? limit : Math.max(1, limit - 1);
+  const named = titles.slice(0, Math.max(1, room)).map((entry) => {
+    const row = {
+      sessionId: entry.sessionId,
+      shortId: entry.shortId,
+      source: entry.source,
+      project: entry.project,
+      timestamp: entry.timestamp,
+      type: 'title',
+      snippets: [paintFragment(entry.fragment, HIGHLIGHT_OPEN, HIGHLIGHT_CLOSE)],
+      contextMessages: [],
+      matchesInSession: 1,
+      matchMode: result.mode,
+      seq: 0,
+      tools: [],
+      title: entry.title,
+      _sessionKey: entry.sessionKey
+    };
+    if (entry.app) {
+      row.app = entry.app;
+      row.desktopKind = entry.desktopKind;
+    }
+    return row;
+  });
+  rows.unshift(...named);
+  rows.splice(Math.max(limit, 1));
+
   return {
     backend: 'elasticsearch',
     mode: result.mode,
     rows,
-    totals: { messages: result.totalMessages, sessions: result.totalSessions },
+    totals: { messages: result.totalMessages + titles.length, sessions: result.totalSessions + titles.length },
     inSession: inSession ? { shortId: inSession.shortId, source: inSession.source, project: inSession.project } : null,
     partial: null,
     facets: result.facets,
@@ -1790,6 +2054,11 @@ async function searchLocal(query, opts) {
       row.subagent = true;
       row.parentSessionId = session.parentSessionId;
     }
+    if (session.app) {
+      row.app = session.app;
+      row.desktopKind = session.desktopKind;
+    }
+    if (group.title) row.title = group.title;
     return row;
   });
 
@@ -1913,7 +2182,10 @@ function printSearchOutcome(query, opts, outcome) {
     console.log(c.dim(`Read around a match: sessions show ${top.shortId} --around ${top.seq}`));
   } else {
     if (outcome.facets && shownSessions.size < totals.sessions) printFacets(outcome.facets);
-    console.log(c.dim(`Drill in: add --session ${top.shortId} for every match in that session, or run: sessions show ${top.shortId} --around ${top.seq}`));
+    // A session found by its name has no matching message to drill into.
+    console.log(c.dim(top.type === 'title'
+      ? `Read it: sessions show ${top.shortId}`
+      : `Drill in: add --session ${top.shortId} for every match in that session, or run: sessions show ${top.shortId} --around ${top.seq}`));
     if (outcome.partial) console.log(c.dim('Older sessions were not read. Raise -n to go further back, or narrow with -p, --days or --since.'));
   }
   if (outcome.footer) console.log(c.dim(outcome.footer));
@@ -1937,8 +2209,9 @@ async function printSyncStatus(elastic, client, es, opts) {
   let labels = [];
   if (details) {
     const local = await getSessionFiles(null, 'all', { subagents: true });
+    const appVisible = (await desktopSessions()).visible;
     [pending, labels] = await Promise.all([
-      elastic.indexedSessions(client, details.index).then(indexed => elastic.compareWithIndex(local, indexed)),
+      elastic.indexedSessions(client, details.index).then(indexed => elastic.compareWithIndex(local, indexed, { appVisible })),
       elastic.labelSummary(client, details.index)
     ]);
   }
@@ -2030,6 +2303,10 @@ async function runSync(opts) {
     }
 
     const everything = await getSessionFiles(null, 'all', { subagents: true });
+    if (opts.prune && unreadableFolders.size > 0) {
+      failWith(`Not pruning: ${plural(unreadableFolders.size, 'folder')} could not be read (${[...unreadableFolders.keys()].map(tildePath).join(', ')}), ` +
+        'so sessions in them would look deleted. Run again without --prune, or once they can be read.');
+    }
     const since = sinceFromOptions(opts);
     let sessions = opts.project || opts.source !== 'all' ? await getSessionFiles(opts.project, opts.source, { subagents: true }) : everything;
     if (since) sessions = sessions.filter(s => s.modifiedAt >= since);
@@ -2045,6 +2322,7 @@ async function runSync(opts) {
       reader: { streamSessionMessages, extractTextContent, isDisplayPrompt },
       scope: { source: opts.source, project: opts.project || null, since: since ? since.toISOString() : null },
       toolVersion: pkg.version,
+      appVisible: (await desktopSessions()).visible,
       rebuild: Boolean(opts.rebuild),
       prune: Boolean(opts.prune),
       dryRun: Boolean(opts.dryRun),
@@ -2366,7 +2644,14 @@ program
 
     for (const s of shown) {
       const meta = opts.full ? await getSessionMeta(s) : await getSessionMetaFast(s);
-      const firstLine = meta.firstPrompt ? truncate(meta.firstPrompt, 90) : c.dim('(empty)');
+      const prompt = meta.firstPrompt ? truncate(meta.firstPrompt, 90) : null;
+      // A session that was given a name leads with it (a subagent, with what
+      // it was asked to do); the prompt it began with follows unless the name
+      // already says the same.
+      const name = typeof s.title === 'string' && s.title ? s.title : null;
+      const firstLine = !name
+        ? prompt || c.dim('(empty)')
+        : c.bold(name) + (prompt && !prompt.toLowerCase().startsWith(name.toLowerCase()) ? c.dim(`  ${truncate(meta.firstPrompt, 70)}`) : '');
       const time = formatRelativeTime(s.modifiedAt);
       const msgInfo = meta.messageCount ? `${meta.messageCount} msg` : '';
 
@@ -2375,6 +2660,7 @@ program
         sourceTag(s.source) + ' ' +
         c.dim(s.project) + ' ' +
         (s.subagent ? c.dim(`${subagentNote(s.parentSessionId)} `) : '') +
+        (s.app ? c.dim(`${desktopNote(s)} `) : '') +
         c.cyan(time) + ' ' +
         (msgInfo ? c.dim(`(${msgInfo}) `) : '') +
         c.dim(formatSize(s.size))
@@ -2394,6 +2680,7 @@ program
             }
           }
         });
+        if (name) console.log(`  ${c.bold(name)}`);
         for (const p of prompts) {
           console.log(c.dim(`    ${p.time}`) + `  ${p.text}`);
         }
@@ -2514,7 +2801,7 @@ program
       console.log(c.bold(`Session: ${session.sessionId}`));
       console.log(c.dim(`Source: ${session.source}`));
       console.log(c.dim(`Project: ${session.project}`));
-      for (const line of subagentHeader(session)) console.log(c.dim(line));
+      for (const line of sessionHeader(session)) console.log(c.dim(line));
       console.log(c.dim(`Around #${center} of ${session.shortId}\n`));
       for (const { position: seq, data } of window) {
         const tag = seq === center ? c.bold.yellow(` #${seq}`) : c.dim(` #${seq}`);
@@ -2562,7 +2849,7 @@ program
     console.log(c.bold(`Session: ${session.sessionId}`));
     console.log(c.dim(`Source: ${session.source}`));
     console.log(c.dim(`Project: ${session.project}`));
-    for (const line of subagentHeader(session)) console.log(c.dim(line));
+    for (const line of sessionHeader(session)) console.log(c.dim(line));
     console.log(c.dim(`Size: ${formatSize(session.size)}  Messages: ${messages.length}\n`));
 
     if (previewMode) {

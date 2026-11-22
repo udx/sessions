@@ -34,6 +34,7 @@ import {
   mergeHighlights,
   parseLabel,
   parseQuery,
+  pendingSessions,
   snapshotDate,
   snapshotName,
   syncIndex,
@@ -216,9 +217,22 @@ function createFakeElastic() {
       const labelTerms = filters.flatMap(clause => Object.entries(clause.term || {}))
         .filter(([field]) => field.startsWith('labels.'))
         .map(([field, spec]) => [field.slice('labels.'.length), String(spec.value).toLowerCase()]);
+      // A search by name: every "must" phrase has to be in the title, no "must_not" one.
+      const phrasesOf = clause => (clause.bool?.should || [clause]).map(item => item.match_phrase?.title?.query).filter(Boolean);
+      const titled = doc => {
+        const title = String(doc.title || '').toLowerCase();
+        const has = clause => phrasesOf(clause).some(phrase => title.includes(String(phrase).toLowerCase()));
+        return (body.query?.bool?.must || []).every(has) && !(body.query?.bool?.must_not || []).some(has);
+      };
+      const wantedSource = term('source');
+      const wantedProject = filters.map(clause => clause.bool?.should?.[0]?.wildcard?.project?.value).find(Boolean);
+      const inProject = doc => !wantedProject ||
+        [doc.project, doc.project_encoded].some(value => String(value || '').toLowerCase().includes(wantedProject.replaceAll('*', '').toLowerCase()));
       const hits = docs.filter(({ doc }) => doc.kind === 'session')
         .filter(({ doc }) => !wantedId || doc.session_id === wantedId || doc.short_id === wantedId || doc.session_id.startsWith(wantedId))
         .filter(({ doc }) => labelTerms.every(([key, value]) => [doc.labels?.[key]].flat().some(item => String(item).toLowerCase() === value)))
+        .filter(({ doc }) => (!wantedSource || doc.source === wantedSource) && inProject(doc))
+        .filter(({ doc }) => titled(doc))
         .sort((a, b) => a.id.localeCompare(b.id))
         .map(({ id, doc }) => ({ _id: id, _source: doc, sort: [doc.session_key] }));
       return { hits: { hits } };
@@ -230,6 +244,13 @@ function createFakeElastic() {
       return { hits: { hits } };
     }
     const response = typeof state.searchResponse === 'function' ? state.searchResponse(body, index) : state.searchResponse;
+    // "In which of these sessions did a message match?" is answered from the
+    // canned message search: the sessions it returns are the ones that did.
+    if (body.size === 0 && body.aggs?.sessions?.terms?.field === 'session_key') {
+      const asked = sessionKeysOf(body.query);
+      const matched = new Set((response?.hits?.hits || []).flatMap(hit => hit.fields?.session_key || []));
+      return { aggregations: { sessions: { buckets: asked.filter(key => matched.has(key)).map(key => ({ key, doc_count: 1 })) } } };
+    }
     return response || { took: 1, hits: { total: { value: 0 }, hits: [] }, aggregations: { sessions: { value: 0 } } };
   };
 
@@ -798,6 +819,84 @@ await test('a subagent transcript is indexed as a session that names its parent'
   assert.deepEqual([mapping.subagent.type, mapping.parent_session_id.type, mapping.agent_type.type], ['boolean', 'keyword', 'keyword']);
 });
 
+await test('a session carries its name and the app it ran in', async () => {
+  const messages = [
+    { type: 'user', timestamp: iso(-300), message: { content: [{ type: 'text', text: 'what can you do here' }] } },
+    { type: 'assistant', timestamp: iso(-200), message: { model: 'm1', content: [{ type: 'text', text: 'Quite a lot.' }] } }
+  ];
+  const reader = {
+    streamSessionMessages: async (_session, callback) => { for (const message of messages) callback(message); },
+    extractTextContent: content => content.filter(block => block.type === 'text').map(block => block.text).join('\n'),
+    isDisplayPrompt: () => true
+  };
+  const base = { sessionId: ALPHA_ID, shortId: 'aaaaaaaa', source: 'claude', project: '/workspace/alpha', filePath: '/tmp/a.jsonl', size: 9, modifiedAt: new Date(now) };
+
+  // Named: the name it was found with, and both kinds of document say where the session ran.
+  const fromApp = await collectSessionDocs({ ...base, title: '  Capabilities   tour ', named: true, app: 'desktop', desktopKind: 'cowork' }, reader);
+  assert.deepEqual([fromApp.sessionDoc.doc.title, fromApp.sessionDoc.doc.named, fromApp.sessionDoc.doc.app, fromApp.sessionDoc.doc.desktop_kind],
+    ['Capabilities tour', true, 'desktop', 'cowork']);
+  assert.deepEqual(fromApp.docs.map(entry => [entry.doc.seq, entry.doc.app, entry.doc.desktop_kind]), [[0, 'desktop', 'cowork'], [1, 'desktop', 'cowork']]);
+
+  // What a subagent was asked to do is shown as its title and is not a name.
+  const described = await collectSessionDocs({ ...base, title: 'Check the ledger', subagent: true, parentSessionId: BETA_ID }, reader);
+  assert.deepEqual([described.sessionDoc.doc.title, described.sessionDoc.doc.named], ['Check the ledger', false]);
+
+  // Not named: the prompt stands in, and the document says it is not a name.
+  const unnamed = await collectSessionDocs(base, reader);
+  assert.deepEqual([unnamed.sessionDoc.doc.title, unnamed.sessionDoc.doc.named, unnamed.sessionDoc.doc.message_count], ['what can you do here', false, 2]);
+  // A run that cannot see the app's data says nothing about the app, so it
+  // cannot undo what a run that can see it wrote.
+  assert.deepEqual(['app' in unnamed.sessionDoc.doc, 'desktop_kind' in unnamed.sessionDoc.doc, 'app' in unnamed.docs[0].doc], [false, false, false]);
+  // One that can see it says null rather than nothing: documents are merged
+  // into, and a field left out would keep what an earlier sync wrote.
+  const seen = await collectSessionDocs(base, reader, { appVisible: true });
+  assert.deepEqual([seen.sessionDoc.doc.app, seen.sessionDoc.doc.desktop_kind, seen.docs[0].doc.app], [null, null, null]);
+
+  const mapping = indexDefinition().mappings.properties;
+  assert.deepEqual([mapping.app.type, mapping.desktop_kind.type, mapping.named.type], ['keyword', 'keyword', 'boolean']);
+});
+
+await test('a session is read again when what is known about it from outside changed', () => {
+  const modifiedAt = new Date(now);
+  const at = { size: 10, modifiedAt };
+  const indexed = new Map([
+    ['claude:same', { ...at, title: 'Old prompt text', named: false }],
+    ['claude:named', { ...at, title: 'Capabilities tour', named: true }],
+    ['claude:renamed', { ...at, title: 'Capabilities tour', named: true }],
+    ['claude:newly', { ...at, title: 'what can you do here', named: false }],
+    // The name is gone: the app no longer knows the session.
+    ['claude:unnamed', { ...at, title: 'Capabilities tour', named: true }],
+    // What a subagent was asked to do, once taken for a name.
+    ['claude:agent', { ...at, title: 'Check the ledger', named: true }],
+    // Written before names were kept: no such fields at all.
+    ['claude:early', { ...at, title: 'a prompt' }],
+    // The app came to know the session, stopped knowing it, or never changed.
+    ['claude:adopted', { ...at, title: 'p', named: false }],
+    ['claude:dropped', { ...at, title: 'p', named: false, app: 'desktop', desktopKind: 'code' }],
+    ['claude:steady', { ...at, title: 'p', named: false, app: 'desktop', desktopKind: 'code' }]
+  ]);
+  const local = [
+    { source: 'claude', sessionId: 'same', ...at },
+    { source: 'claude', sessionId: 'named', ...at, title: 'Capabilities   tour', named: true },
+    { source: 'claude', sessionId: 'renamed', ...at, title: 'Grand tour', named: true },
+    { source: 'claude', sessionId: 'newly', ...at, title: 'Capabilities tour', named: true },
+    { source: 'claude', sessionId: 'unnamed', ...at },
+    { source: 'claude', sessionId: 'agent', ...at, title: 'Check the ledger', subagent: true },
+    { source: 'claude', sessionId: 'early', ...at },
+    { source: 'claude', sessionId: 'adopted', ...at, app: 'desktop', desktopKind: 'code' },
+    { source: 'claude', sessionId: 'dropped', ...at },
+    { source: 'claude', sessionId: 'steady', ...at, app: 'desktop', desktopKind: 'code' }
+  ];
+  const seeing = { appVisible: true };
+  assert.deepEqual(pendingSessions(local, indexed, seeing).map(session => session.sessionId), ['renamed', 'newly', 'unnamed', 'agent', 'adopted', 'dropped']);
+  assert.deepEqual(compareWithIndex(local, indexed, seeing), { changed: 6, added: 0, missing: 0, bytes: 60 });
+  // A run that cannot see the app's data does not take "dropped" for a
+  // change: it has no way to know what the app knows. Two runs sharing an
+  // index, one of them blind to the app, would otherwise undo each other.
+  assert.deepEqual(pendingSessions(local, indexed).map(session => session.sessionId), ['renamed', 'newly', 'unnamed', 'agent', 'adopted']);
+  assert.deepEqual(compareWithIndex(local, indexed), { changed: 5, added: 0, missing: 0, bytes: 50 });
+});
+
 await test('local sessions are compared with the indexed ones', () => {
   const modifiedAt = new Date(now);
   const local = [
@@ -1138,7 +1237,11 @@ await test('an empty strict search walks the fallback modes in order', async () 
   const result = await ok(['search', 'alphaword betaword'], fakeEnv);
   assert.match(result.stdout, /No matches for "alphaword betaword"\./);
   assert.match(result.stdout, /Elasticsearch index synced/);
-  const bodies = fake.state.requests.filter(request => request.path.endsWith('/_search')).map(request => JSON.stringify(request.body));
+  const searches = fake.state.requests.filter(request => request.path.endsWith('/_search')).map(request => JSON.stringify(request.body));
+  // One request asks which sessions the query names; the rest search messages.
+  const byName = searches.filter(body => body.includes('"match_phrase":{"title"'));
+  assert.equal(byName.length, 1);
+  const bodies = searches.filter(body => !byName.includes(body));
   // smart, prefix, literal, tool calls, session aggregation, fuzzy, partial
   assert.equal(bodies.length, 7);
   assert.equal(bodies[0].includes('"prefix"'), false);
@@ -1372,10 +1475,17 @@ await test('a search indexes what fits its budget and says what it left', async 
   const indexed = [...entry.docs.values()].filter(doc => doc.kind === 'session').map(doc => doc.session_id).sort();
   assert.deepEqual(indexed, [ALPHA_ID, KIMI_ID].sort());
   assert.match(partial.stdout, /^Elasticsearch index synced just now; 2 sessions \(\d+(\.\d+)? (B|KB)\) not indexed yet, run "sessions sync"$/m);
-  // A full sync picks up exactly what was left.
+  // The searches that follow do not count again until auto_sync is due, and
+  // they still say what is waiting: it is kept with the sync's record.
+  const before = bulkCount();
+  const again = await ok(['search', 'authentication'], roomy);
+  assert.equal(bulkCount(), before, 'nothing more was read');
+  assert.match(again.stdout, /^Elasticsearch index synced just now; 2 sessions \(\d+(\.\d+)? (B|KB)\) not indexed yet, run "sessions sync"$/m);
+  // A full sync picks up exactly what was left, and the note goes with it.
   const rest = await json(['sync'], fakeEnv);
   assert.equal(rest.sessions, 2);
   assert.equal(rest.unchanged, 2);
+  assert.match((await ok(['search', 'authentication'], roomy)).stdout, /^Elasticsearch index synced just now$/m);
 
   const file = path.join(root, 'config-budget.yaml');
   writeFileSync(file, 'elasticsearch:\n  url: http://127.0.0.1:1\n  auto_sync: 5\n  auto_sync_max_mb: 32\n');
@@ -1434,8 +1544,93 @@ await test('indexed subagent matches say whose they are', async () => {
   const [row] = await json(['search', 'authentication'], fakeEnv);
   assert.equal(row.subagent, true);
   assert.equal(row.parentSessionId, ALPHA_ID);
-  const body = fake.state.requests.filter(request => request.path.endsWith('/_search')).at(-1).body;
+  const body = fake.state.requests.filter(request => request.path.endsWith('/_search') && request.body.collapse).at(-1).body;
   assert.equal(body.collapse.inner_hits._source.includes('parent_session_id'), true);
+});
+
+await test('a session is found by its name through the index', async () => {
+  // Not "Claude": on a case-insensitive disk that is the fixtures' "claude" folder.
+  const appDir = path.join(root, 'desktop-app');
+  const record = path.join(appDir, 'claude-code-sessions', 'acct', 'org', 'local_1.json');
+  mkdirSync(path.dirname(record), { recursive: true });
+  writeFileSync(record, JSON.stringify({ sessionId: 'local_1', cliSessionId: ALPHA_ID, title: 'Login outage postmortem', cwd: '/workspace/alpha' }));
+  const named = { ...fakeEnv, SESSIONS_CLAUDE_DESKTOP_DIR: appDir };
+
+  fake.reset();
+  await ok(['sync'], fakeEnv);
+  // The name arrived after the session was indexed, with the transcript untouched.
+  const renamed = await json(['sync'], named);
+  assert.equal(renamed.sessions, 1);
+  const [, entry] = fakeIndex();
+  const doc = entry.docs.get(`claude:${ALPHA_ID}`);
+  assert.deepEqual([doc.title, doc.named, doc.app, doc.desktop_kind], ['Login outage postmortem', true, 'desktop', 'code']);
+  assert.equal((await json(['sync'], named)).sessions, 0, 'and then it is up to date');
+
+  // No message says "postmortem"; the name answers.
+  const human = await ok(['search', 'outage postmortem'], named);
+  const lines = human.stdout.trimEnd().split('\n');
+  assert.equal(lines[0], '1 match in 1 session');
+  assert.match(lines[1], /^aaaaaaaa \[claude\] \/workspace\/alpha \(desktop\) title .* #0$/);
+  assert.equal(lines[2].trim(), 'Login outage postmortem');
+  const [row] = await json(['search', 'postmortem'], named);
+  assert.deepEqual([row.sessionId, row.type, row.seq, row.title, row.app, row.desktopKind], [ALPHA_ID, 'title', 0, 'Login outage postmortem', 'desktop', 'code']);
+  assert.equal((await json(['search', 'postmortem NOT outage'], named)).length, 0);
+  assert.equal((await json(['search', 'postmortem', '--source', 'codex'], named)).length, 0);
+  assert.equal((await json(['search', 'postmortem', '-p', 'beta'], named)).length, 0);
+
+  // A session a message already brought up is not listed a second time for
+  // its name, and is not counted twice.
+  fake.state.searchResponse = (_body, index) => cannedHit(index);
+  const both = await json(['search', 'postmortem'], named);
+  assert.deepEqual(both.map(item => item.type), ['assistant']);
+  assert.match((await ok(['search', 'postmortem'], named)).stdout, /^3 matches in 1 session$/m);
+
+  // Another session that only its name brings up is added to the messages
+  // that matched: counted once, listed first, and never instead of them.
+  const second = path.join(appDir, 'claude-code-sessions', 'acct', 'org', 'local_2.json');
+  writeFileSync(second, JSON.stringify({ sessionId: 'local_2', cliSessionId: BETA_ID, title: 'Postmortem template', cwd: '/workspace/beta' }));
+  assert.equal((await json(['sync'], named)).sessions, 1);
+  const mixed = await ok(['search', 'postmortem'], named);
+  assert.match(mixed.stdout, /^4 matches in 2 sessions$/m);
+  assert.deepEqual((await json(['search', 'postmortem'], named)).map(item => [item.shortId, item.type]), [['bbbbbbbb', 'title'], ['aaaaaaaa', 'assistant']]);
+  assert.deepEqual((await json(['search', 'postmortem', '-n', '2'], named)).map(item => item.type), ['title', 'assistant']);
+  // The closing hint points at something that works for the row it names.
+  assert.match(mixed.stdout, /^Read it: sessions show bbbbbbbb$/m);
+  rmSync(second);
+  assert.equal((await json(['sync'], named)).sessions, 1, 'a session the app no longer knows is read again');
+  const forgotten = fakeIndex()[1].docs.get(`claude:${BETA_ID}`);
+  assert.deepEqual([forgotten.named, forgotten.app, forgotten.desktop_kind], [false, null, null]);
+  assert.equal((await json(['sync'], named)).sessions, 0, 'once');
+
+  // An index written before names were kept learns them at the next sync,
+  // and only for the sessions that have one.
+  const early = fakeIndex()[1].docs.get(`claude:${ALPHA_ID}`);
+  delete early.named;
+  delete early.app;
+  delete early.desktop_kind;
+  early.title = 'the prompt it began with';
+  const learned = await json(['sync'], named);
+  assert.deepEqual([learned.sessions, learned.unchanged], [1, 3]);
+  const relearned = fakeIndex()[1].docs.get(`claude:${ALPHA_ID}`);
+  assert.deepEqual([relearned.title, relearned.named, relearned.app], ['Login outage postmortem', true, 'desktop']);
+
+  // A run that cannot see the app's data leaves what the app knows alone.
+  await ok(['sync'], fakeEnv);
+  assert.equal(fakeIndex()[1].docs.get(`claude:${ALPHA_ID}`).app, 'desktop');
+  assert.equal('app' in fakeIndex()[1].docs.get(`claude:${BETA_ID}`) ? fakeIndex()[1].docs.get(`claude:${BETA_ID}`).app : null, null);
+
+  // Searches about who spoke, which tool ran, one session or an exact string ask no such thing.
+  for (const args of [['--role', 'user'], ['--tool', 'Bash'], ['--session', 'aaaaaaaa'], ['--literal']]) {
+    fake.state.requests.length = 0;
+    await ok(['search', 'postmortem', ...args], named);
+    const asked = fake.state.requests.filter(request => request.path.endsWith('/_search') && JSON.stringify(request.body).includes('"match_phrase":{"title"'));
+    assert.equal(asked.length, 0, args.join(' '));
+  }
+
+  // An unnamed session's title is its first prompt, which is not a name to answer to.
+  fake.state.searchResponse = null;
+  assert.equal((await json(['search', 'pickleball scheduling'], named)).length, 0);
+  rmSync(appDir, { recursive: true, force: true });
 });
 
 await test('label sets, shows, and removes labels', async () => {
@@ -1843,6 +2038,87 @@ if (!liveUrl) {
       assert.equal((await listSnapshots()).length, 2);
       const status = await json(['sync', '--status'], liveEnv);
       assert.equal(status.index.name, summary.index);
+    });
+
+    await test('a session is found by the name the desktop app gave it', async () => {
+      const appDir = path.join(root, 'desktop-app-live');
+      const record = path.join(appDir, 'claude-code-sessions', 'acct', 'org', 'local_1.json');
+      mkdirSync(path.dirname(record), { recursive: true });
+      writeFileSync(record, JSON.stringify({ sessionId: 'local_1', cliSessionId: BETA_ID, title: 'Court booking walkthrough', cwd: '/workspace/beta' }));
+      const named = { ...liveEnv, SESSIONS_CLAUDE_DESKTOP_DIR: appDir };
+      // The transcript did not change; the name alone makes sync read it again.
+      const synced = await json(['sync'], named);
+      assert.equal(synced.sessions, 1);
+      const [row] = await overview(['booking walkthrough'], named);
+      assert.deepEqual([row.sessionId, row.type, row.seq, row.title, row.app, row.desktopKind], [BETA_ID, 'title', 0, 'Court booking walkthrough', 'desktop', 'code']);
+      const human = await ok(['search', 'walkthrough'], named);
+      assert.match(human.stdout, /^bbbbbbbb \[claude\] \/workspace\/beta \(desktop\) title .* #0$/m);
+      // A message that matches speaks for the session instead of its name.
+      const said = await overview(['pickleball'], named);
+      assert.deepEqual(said.map(item => [item.sessionId, item.type, item.app]), [[BETA_ID, 'user', 'desktop']]);
+      assert.equal((await overview(['walkthrough', '--source', 'kimi'], named)).length, 0);
+      assert.equal((await overview(['walkthrough NOT booking'], named)).length, 0);
+
+      // A name that holds a word the session also says: the message speaks
+      // for the session, which is listed once and counted once.
+      writeFileSync(record, JSON.stringify({ sessionId: 'local_1', cliSessionId: BETA_ID, title: 'Pickleball court walkthrough', cwd: '/workspace/beta' }));
+      assert.equal((await json(['sync'], named)).sessions, 1, 'a rename is read again');
+      const once = await overview(['pickleball'], named);
+      assert.deepEqual(once.map(item => [item.sessionId, item.type]), [[BETA_ID, 'user']]);
+      assert.match((await ok(['search', 'pickleball'], named)).stdout, /^1 match in 1 session$/m);
+      assert.deepEqual((await overview(['walkthrough'], named)).map(item => [item.sessionId, item.type]), [[BETA_ID, 'title']]);
+      // The same when the name and a message answer different halves of an OR.
+      const either = await overview(['kubernetes OR walkthrough'], named);
+      assert.deepEqual(either.filter(item => item.sessionId === BETA_ID).map(item => item.type), ['user']);
+
+      // The app stops knowing the session: its name leaves the index.
+      rmSync(appDir, { recursive: true, force: true });
+      assert.equal((await json(['sync'], liveEnv)).sessions, 1);
+      assert.equal((await overview(['walkthrough'], liveEnv)).length, 0);
+      assert.equal((await json(['sync'], liveEnv)).sessions, 0);
+    });
+
+    await test('a named session is found behind hundreds of newer look-alikes', async () => {
+      // Sessions without a name carry their first prompt as their title, so a
+      // search by name has to read past them, a page at a time.
+      const crowd = path.join(root, 'crowd');
+      const crowdProject = path.join(crowd, 'claude', 'projects', '-workspace-crowd');
+      const crowdApp = path.join(crowd, 'desktop-app');
+      mkdirSync(crowdProject, { recursive: true });
+      const id = number => `${String(number).padStart(8, '0')}-2222-4222-8333-cccccccccccc`;
+      for (let number = 1; number <= 205; number++) {
+        const file = path.join(crowdProject, `${id(number)}.jsonl`);
+        writeFileSync(file, JSON.stringify(claudeMessage('user', `harbor ledger review number ${number}`, -5_000, '/workspace/crowd')) + '\n');
+        const at = new Date(now - 60_000 - number * 1000);
+        utimesSync(file, at, at);
+      }
+      const namedId = id(999);
+      const file = path.join(crowdProject, `${namedId}.jsonl`);
+      writeFileSync(file, JSON.stringify(claudeMessage('user', 'what changed in the quarterly numbers', -9_000, '/workspace/crowd')) + '\n');
+      const old = new Date(now - 3_600_000);
+      utimesSync(file, old, old);
+      const record = path.join(crowdApp, 'claude-code-sessions', 'acct', 'org', 'local_9.json');
+      mkdirSync(path.dirname(record), { recursive: true });
+      writeFileSync(record, JSON.stringify({ sessionId: 'local_9', cliSessionId: namedId, title: 'Harbor ledger review', cwd: '/workspace/crowd' }));
+
+      const crowdEnv = {
+        ...liveEnv,
+        SESSIONS_ES_INDEX: `${alias}-crowd`,
+        SESSIONS_CLAUDE_DIR: path.join(crowd, 'claude'),
+        SESSIONS_CODEX_DIR: path.join(crowd, 'codex'),
+        SESSIONS_KIMI_DIR: path.join(crowd, 'kimi'),
+        SESSIONS_CLAUDE_DESKTOP_DIR: crowdApp
+      };
+      try {
+        assert.equal((await json(['sync'], crowdEnv)).sessions, 206);
+        const rows = await overview(['harbor ledger review', '-n', '4'], crowdEnv);
+        assert.deepEqual(rows.map(item => item.type), ['title', 'user', 'user', 'user']);
+        assert.equal(rows[0].sessionId, namedId);
+        assert.match((await ok(['search', 'harbor ledger review', '-n', '4'], crowdEnv)).stdout, /^206 matches in 206 sessions/m);
+      } finally {
+        await cli(['sync', '--drop'], crowdEnv);
+        rmSync(crowd, { recursive: true, force: true });
+      }
     });
 
     await test('--drop removes the index and search falls back', async () => {
