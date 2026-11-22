@@ -520,6 +520,15 @@ function chunked(list, size) {
   return chunks;
 }
 
+// The local sessions a sync would read: new ones, and ones whose transcript
+// changed since it was indexed. They keep the order they were given in.
+export function pendingSessions(localSessions, indexed) {
+  return localSessions.filter((session) => {
+    const entry = indexed.get(keyOf(session));
+    return !entry || !sameFingerprint(entry, session);
+  });
+}
+
 // Compares local sessions with an index: what the next sync would write, and
 // which indexed sessions no longer have a transcript on disk.
 // `bytes` is the size on disk of the transcripts a sync would read.

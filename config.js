@@ -6,8 +6,10 @@ export const DEFAULT_INDEX = 'sessions';
 export const DEFAULT_KEEP = 1;
 export const DEFAULT_AUTO_SYNC_MINUTES = 10;
 // The most transcript, in megabytes, that a search will index on its own
-// before answering. More than that waits for "sessions sync".
-export const DEFAULT_AUTO_SYNC_MAX_MB = 256;
+// before answering. What does not fit waits for the next search or for
+// "sessions sync". Large enough to take in a long session that is still being
+// written, which is often the one worth finding.
+export const DEFAULT_AUTO_SYNC_MAX_MB = 1024;
 
 const BACKEND_ALIASES = new Map([
   ['auto', 'auto'],

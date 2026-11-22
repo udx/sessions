@@ -197,7 +197,7 @@ elasticsearch:
   url: http://127.0.0.1:9220
   index: sessions        # optional, this is the default
   auto_sync: 10          # optional: minutes before a search refreshes the index
-  auto_sync_max_mb: 256  # optional: the most a search will index on its own
+  auto_sync_max_mb: 1024 # optional: the most a search will index on its own
 search:
   backend: auto          # auto (default), elasticsearch, or local
 ```
@@ -225,7 +225,7 @@ sessions sync --drop               # delete the index
 
 Sync is incremental. It compares each transcript's size and modification time with what was indexed, re-reads the ones that changed, and merges its own fields into the existing documents. A typical run takes a second or two. It records its progress as it goes, so a run that is interrupted keeps the sessions it finished and the next one carries on from there.
 
-With `auto_sync` set, a search does this first whenever the last sync is older than that many minutes. When more than `auto_sync_max_mb` of transcript is waiting, the search answers from the index as it is and ends with what is waiting, for example `42 sessions (1.3 GB) not indexed yet, run "sessions sync"`.
+With `auto_sync` set, a search does this first whenever the last sync is older than that many minutes. It reads at most `auto_sync_max_mb` of transcript, newest sessions first, and leaves what does not fit for the next search or for `sessions sync`, ending with what is waiting, for example `3 sessions (2.4 GB) not indexed yet, run "sessions sync"`.
 
 Search reflects the last sync, and every result ends with how long ago that was.
 
@@ -348,7 +348,7 @@ Elasticsearch settings come from command-line flags, then environment variables,
 | `SESSIONS_ES_USERNAME`, `SESSIONS_ES_PASSWORD` | `elasticsearch.username`, `elasticsearch.password` | Basic authentication |
 | `SESSIONS_ES_ALLOW_REMOTE` | `elasticsearch.allow_remote` | Permit a host other than this machine |
 | `SESSIONS_ES_AUTO_SYNC` | `elasticsearch.auto_sync` | Minutes before a search refreshes the index; `0` is off (default) |
-| `SESSIONS_ES_AUTO_SYNC_MAX_MB` | `elasticsearch.auto_sync_max_mb` | The most transcript, in megabytes, a search indexes on its own (default `256`) |
+| `SESSIONS_ES_AUTO_SYNC_MAX_MB` | `elasticsearch.auto_sync_max_mb` | The most transcript, in megabytes, a search indexes on its own (default `1024`) |
 | | `elasticsearch.keep` | Indices to keep after a rebuild (default 1) |
 | `SESSIONS_SEARCH_BACKEND` | `search.backend` | `auto` (default), `elasticsearch`, or `local` |
 
@@ -365,6 +365,7 @@ Kimi Code sessions come in two on-disk generations, and both are read. Modern se
 ## Changelog
 
 ### Unreleased
+- A search with `auto_sync` now indexes the newest sessions that fit in `auto_sync_max_mb` and leaves only the rest. In 1.11.0 it indexed nothing at all once the total waiting passed the limit, so one large session that kept changing stopped every other session from being indexed. The default limit is now 1024
 - The dashboard is laid out as a tool: a rail on the left filters by agent and project with counts, and sessions are listed in a dense table, about three times as many per screen. Agents are named the way the command line prints them (`[claude]`, `[codex]`, `[kimi]`). The typefaces ship with the tool, so the page still loads nothing from outside your machine
 - A compressed Codex session that was cut off is reported on Node 22 as well. That version's built-in decoder ends such a file without an error, so the tool now follows the archive's frames itself
 

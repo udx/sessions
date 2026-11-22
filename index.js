@@ -1516,9 +1516,12 @@ const SEARCH_MODE_NOTES = {
 
 // With auto_sync set, a search first brings the index up to date when its
 // last sync is older than that many minutes. Only changed transcripts are
-// re-read, so this usually takes a second or two. When there is more to read
-// than auto_sync_max_mb, the search answers from the index as it is and says
-// what is waiting, because whoever is searching is waiting too.
+// re-read, so this usually takes a second or two.
+//
+// Whoever is searching is waiting, so a search reads at most auto_sync_max_mb
+// of transcript. It takes the newest sessions that fit and leaves the rest,
+// and says what it left. Taking nothing when the total is too large would
+// freeze the index for as long as one big session keeps changing.
 async function refreshIfStale(elastic, client, config, snapshot) {
   const es = config.elasticsearch;
   if (!es.autoSyncMinutes || !snapshot.syncedAt) return snapshot;
@@ -1527,21 +1530,37 @@ async function refreshIfStale(elastic, client, config, snapshot) {
   if (!isLoopbackUrl(es.url) && !es.allowRemote) return snapshot;
   try {
     const everything = await getSessionFiles(null, 'all', { subagents: true });
-    const waiting = elastic.compareWithIndex(everything, await elastic.indexedSessions(client, snapshot.index));
-    if (waiting.bytes > es.autoSyncMaxMb * 1024 * 1024) {
-      return { ...snapshot, backlog: { sessions: waiting.changed + waiting.added, bytes: waiting.bytes } };
+    const waiting = elastic.pendingSessions(everything, await elastic.indexedSessions(client, snapshot.index));
+    const budget = es.autoSyncMaxMb * 1024 * 1024;
+    const taken = [];
+    const left = [];
+    let used = 0;
+    for (const session of waiting) {
+      const size = session.size || 0;
+      if (used + size <= budget) {
+        taken.push(session);
+        used += size;
+      } else {
+        left.push(session);
+      }
     }
-    await elastic.syncIndex({
-      client,
-      alias: es.index,
-      keep: es.keep,
-      sessions: everything,
-      allSessionKeys: everything.map(sessionKey),
-      reader: { streamSessionMessages, extractTextContent, isDisplayPrompt },
-      scope: { source: 'all', project: null, since: null },
-      toolVersion: pkg.version
-    });
-    return (await elastic.currentSnapshot(client, es.index)) || snapshot;
+
+    let refreshed = snapshot;
+    if (taken.length > 0 || waiting.length === 0) {
+      await elastic.syncIndex({
+        client,
+        alias: es.index,
+        keep: es.keep,
+        sessions: waiting.length === 0 ? everything : taken,
+        allSessionKeys: everything.map(sessionKey),
+        reader: { streamSessionMessages, extractTextContent, isDisplayPrompt },
+        scope: { source: 'all', project: null, since: null },
+        toolVersion: pkg.version
+      });
+      refreshed = (await elastic.currentSnapshot(client, es.index)) || snapshot;
+    }
+    if (left.length === 0) return refreshed;
+    return { ...refreshed, backlog: { sessions: left.length, bytes: left.reduce((sum, session) => sum + (session.size || 0), 0) } };
   } catch (error) {
     if (error.name !== 'ElasticError') throw error;
     console.error(c.dim(`Could not refresh the index (${error.message}); results are as of the last sync.`));

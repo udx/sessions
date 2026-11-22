@@ -12,7 +12,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -1347,10 +1347,11 @@ await test('auto_sync refreshes a stale index before searching', async () => {
   assert.equal(bulkCount(), 0, 'never rebuilds as a side effect of searching');
 });
 
-await test('a search leaves a large backlog to "sessions sync"', async () => {
+await test('a search indexes what fits its budget and says what it left', async () => {
   fake.reset();
   seedSnapshot(fake.state, 'sessions-20260101-000000', { alias: 'sessions' });
   fake.state.searchResponse = (_body, index) => cannedHit(index);
+  // Nothing fits: the search reads no transcript and names all four.
   const tight = { ...fakeEnv, SESSIONS_ES_AUTO_SYNC: '5', SESSIONS_ES_AUTO_SYNC_MAX_MB: '0.0001' };
   const result = await ok(['search', 'authentication'], tight);
   assert.equal(bulkCount(), 0, 'nothing is indexed as a side effect');
@@ -1358,12 +1359,31 @@ await test('a search leaves a large backlog to "sessions sync"', async () => {
   // The answer still came from the index.
   assert.match(result.stdout, /^3 matches in 1 session$/m);
 
+  // Room for the first session and the smallest one: those two are indexed,
+  // the two in between do not fit and wait. One session that is too large
+  // must not keep the others out.
+  const size = file => statSync(file).size;
+  assert.equal(size(betaPath) > size(kimiPath) && size(codexPath) > size(kimiPath), true, 'fixture sizes');
+  const megabytes = (size(alphaPath) + size(kimiPath) + 0.5) / (1024 * 1024);
+  const roomy = { ...fakeEnv, SESSIONS_ES_AUTO_SYNC: '5', SESSIONS_ES_AUTO_SYNC_MAX_MB: String(megabytes) };
+  const partial = await ok(['search', 'authentication'], roomy);
+  assert.equal(bulkCount() > 0, true);
+  const [, entry] = fakeIndex();
+  const indexed = [...entry.docs.values()].filter(doc => doc.kind === 'session').map(doc => doc.session_id).sort();
+  assert.deepEqual(indexed, [ALPHA_ID, KIMI_ID].sort());
+  assert.match(partial.stdout, /^Elasticsearch index synced just now; 2 sessions \(\d+(\.\d+)? (B|KB)\) not indexed yet, run "sessions sync"$/m);
+  // A full sync picks up exactly what was left.
+  const rest = await json(['sync'], fakeEnv);
+  assert.equal(rest.sessions, 2);
+  assert.equal(rest.unchanged, 2);
+
   const file = path.join(root, 'config-budget.yaml');
   writeFileSync(file, 'elasticsearch:\n  url: http://127.0.0.1:1\n  auto_sync: 5\n  auto_sync_max_mb: 32\n');
   assert.equal((await loadConfig({ env: { SESSIONS_CONFIG: file } })).elasticsearch.autoSyncMaxMb, 32);
   assert.equal((await loadConfig({ env: { SESSIONS_CONFIG: file, SESSIONS_ES_AUTO_SYNC_MAX_MB: '8' } })).elasticsearch.autoSyncMaxMb, 8);
-  assert.equal((await loadConfig({ env: { SESSIONS_CONFIG: path.join(root, 'absent-config.yaml') } })).elasticsearch.autoSyncMaxMb, 256);
-  assert.equal((await loadConfig({ env: { SESSIONS_CONFIG: file, SESSIONS_ES_AUTO_SYNC_MAX_MB: 'lots' } })).elasticsearch.autoSyncMaxMb, 256);
+  assert.equal((await loadConfig({ env: { SESSIONS_CONFIG: path.join(root, 'absent-config.yaml') } })).elasticsearch.autoSyncMaxMb, 1024);
+  // A value that is not a number is ignored in favor of the default.
+  assert.equal((await loadConfig({ env: { SESSIONS_CONFIG: file, SESSIONS_ES_AUTO_SYNC_MAX_MB: 'lots' } })).elasticsearch.autoSyncMaxMb, 1024);
 });
 
 await test('an interrupted sync keeps the sessions it finished', async () => {
