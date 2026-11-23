@@ -142,9 +142,19 @@ write(rolloutPath(`rollout-2026-07-01T01-00-00-${FORK_PARENT}_${FORK_CHILD}.json
 
 const zstdBuiltIn = typeof zlib.zstdCompressSync === 'function';
 const zstdCommand = spawnSync('zstd', ['--version'], { stdio: 'ignore' }).status === 0;
+// With the command, from a file and not through a pipe: handed a large text
+// on its standard input this way, it sometimes never came back, and the
+// fixture was written empty. A fixture that cannot be made stops the suite.
+let compressed = 0;
 function compress(text) {
   if (zstdBuiltIn) return zlib.zstdCompressSync(Buffer.from(text));
-  const result = spawnSync('zstd', ['-c'], { input: text, maxBuffer: 1 << 28, timeout: 30_000 });
+  const plain = path.join(root, `to-compress-${++compressed}`);
+  writeFileSync(plain, text);
+  const result = spawnSync('zstd', ['-c', '--', plain], { maxBuffer: 1 << 28, timeout: 60_000 });
+  rmSync(plain);
+  if (result.status !== 0 || result.stdout.length === 0) {
+    throw new Error(`zstd could not compress a test fixture: ${result.error?.message || String(result.stderr).trim() || `status ${result.status}`}`);
+  }
   return result.stdout;
 }
 const canCompress = zstdBuiltIn || zstdCommand;
