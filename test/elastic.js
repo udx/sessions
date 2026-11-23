@@ -940,6 +940,61 @@ await test('a session is read again when what is known about it from outside cha
   assert.deepEqual(compareWithIndex(local, indexed), { changed: 5, added: 0, missing: 0, bytes: 50 });
 });
 
+await test('a session of the app is read again when the folder it is filed under changed', () => {
+  const at = { size: 10, modifiedAt: new Date(now) };
+  const cowork = { app: 'desktop', desktopKind: 'cowork' };
+  // Filed where a record of the app says: discovery marks such a session.
+  const byRecord = { filedByRecord: true };
+  const indexed = new Map([
+    // Indexed under the path it ran in, before the folder it was given was known.
+    ['claude:refiled', { ...at, title: 'Budget review', named: true, ...cowork, project: '/sessions/calm-ibis' }],
+    ['claude:steady', { ...at, title: 'Budget review', named: true, ...cowork, project: '/work/budget' }],
+    // Indexed under its folder by a run that saw the record. This run sees
+    // only a copy without one, and has nothing better to say.
+    ['claude:fallback', { ...at, title: 'p', named: false, ...cowork, project: '/work/budget' }],
+    // Not a session of the app: where it is filed comes from its transcript,
+    // which has not changed.
+    ['claude:terminal', { ...at, title: 'p', named: false, project: '/work/old-name' }],
+    // An index read without that field has nothing to compare.
+    ['claude:unknown', { ...at, title: 'p', named: false, ...cowork }]
+  ]);
+  const local = [
+    { source: 'claude', sessionId: 'refiled', ...at, title: 'Budget review', named: true, ...cowork, ...byRecord, project: '/work/budget' },
+    { source: 'claude', sessionId: 'steady', ...at, title: 'Budget review', named: true, ...cowork, ...byRecord, project: '/work/budget' },
+    { source: 'claude', sessionId: 'fallback', ...at, ...cowork, project: '/private/var/empty' },
+    { source: 'claude', sessionId: 'terminal', ...at, project: '/work/new-name' },
+    { source: 'claude', sessionId: 'unknown', ...at, ...cowork, ...byRecord, project: '/work/budget' }
+  ];
+  for (const options of [{ appVisible: true }, {}]) {
+    assert.deepEqual(pendingSessions(local, indexed, options).map(session => session.sessionId), ['refiled'], JSON.stringify(options));
+  }
+  // What a subagent left is filed with the session it worked for, and has no
+  // mark of the app of its own. A run that can see the app's data reads it
+  // again when a record refiled its session; one that cannot leaves it be,
+  // and so does one that only has the path a copy ran in to go by.
+  const agents = new Map([
+    ['claude:moved', { ...at, title: 'Check the ledger', named: false, project: '/work/plans' }],
+    ['claude:stayed', { ...at, title: 'Check the ledger', named: false, project: '/work/ledger' }],
+    ['claude:adrift', { ...at, title: 'Check the ledger', named: false, project: '/work/plans' }]
+  ]);
+  const found = [
+    { source: 'claude', sessionId: 'moved', ...at, title: 'Check the ledger', subagent: true, parentSessionId: 'refiled', ...byRecord, project: '/work/ledger' },
+    { source: 'claude', sessionId: 'stayed', ...at, title: 'Check the ledger', subagent: true, parentSessionId: 'steady', ...byRecord, project: '/work/ledger' },
+    { source: 'claude', sessionId: 'adrift', ...at, title: 'Check the ledger', subagent: true, parentSessionId: 'fallback', project: '/private/var/empty' }
+  ];
+  assert.deepEqual(pendingSessions(found, agents, { appVisible: true }).map(session => session.sessionId), ['moved']);
+  assert.deepEqual(pendingSessions(found, agents).map(session => session.sessionId), []);
+  // The name of the folder a session is kept in is matched by a filter too,
+  // and a subagent takes its session's: a change of that alone is a change.
+  const kept = new Map([
+    ['claude:renamed', { ...at, title: 'Check the ledger', named: false, project: '/work/ledger', projectEncoded: '-sandbox-old' }],
+    ['claude:same', { ...at, title: 'Check the ledger', named: false, project: '/work/ledger', projectEncoded: '-sandbox-new' }],
+    ['claude:early', { ...at, title: 'Check the ledger', named: false, project: '/work/ledger' }]
+  ]);
+  const now_ = id => ({ source: 'claude', sessionId: id, ...at, title: 'Check the ledger', subagent: true, ...byRecord, project: '/work/ledger', projectEncoded: '-sandbox-new' });
+  assert.deepEqual(pendingSessions(['renamed', 'same', 'early'].map(now_), kept, { appVisible: true }).map(session => session.sessionId), ['renamed']);
+});
+
 await test('local sessions are compared with the indexed ones', () => {
   const modifiedAt = new Date(now);
   const local = [

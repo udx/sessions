@@ -12,7 +12,8 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import { displayUrl, isLoopbackUrl, isValidIndexName, loadConfig } from './lib/config.js';
 import { HIGHLIGHT_OPEN, HIGHLIGHT_CLOSE } from './lib/query.js';
-import { desktopDataDirs, desktopNote, findCoworkSessions, readCodeRecords } from './lib/desktop.js';
+import { desktopDataDirs, desktopNote, findCoworkSessions, holdsATranscript, namedDesktopDirs, namedFolderTrouble, readCodeRecords, readsUsualDesktopDirs } from './lib/desktop.js';
+import { isConversationFolder } from './lib/projects.js';
 import { createFrameWatch } from './lib/zstd-frames.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -399,6 +400,37 @@ function listSessionFolder(dir, ofApp) {
   return ofApp ? listNoting(dir) : fs.readdir(dir);
 }
 
+// What there is to say about the config file, each thing once in a run
+// however many parts of a command read the file.
+const saidAboutConfig = new Set();
+function sayOnce(message) {
+  if (!message || saidAboutConfig.has(message)) return;
+  saidAboutConfig.add(message);
+  console.error(c.yellow(message));
+}
+
+// Places the config file adds to the ones looked in anyway ("paths"). Read
+// once in a run, and only when they count: a run told where the desktop
+// app's data is, or told to leave it alone, does not open the file for them.
+// What in it cannot be used is said, since a place that is silently not
+// looked in reads as "no sessions there".
+let placesFromConfig = null;
+// What was wrong with the file where it names places. While there is any,
+// the places it meant to name are not known, and neither is what is in them.
+const placesInDoubt = [];
+function configuredPlaces() {
+  if (!readsUsualDesktopDirs()) return Promise.resolve({ claudeDesktop: [] });
+  placesFromConfig ||= loadConfig().then(config => {
+    for (const warning of [config.fileWarning, ...config.paths.warnings]) {
+      if (!warning) continue;
+      sayOnce(warning);
+      placesInDoubt.push(warning);
+    }
+    return config.paths;
+  });
+  return placesFromConfig;
+}
+
 // What the Claude desktop app knows about its sessions: a record for each
 // Code tab session, keyed by transcript, and the storage folder of each
 // Cowork session. Kept for a few seconds, so one command reads it once and
@@ -408,28 +440,52 @@ let desktopState = null;
 async function desktopSessions() {
   if (desktopState && Date.now() - desktopState.readAt < DESKTOP_STATE_MS) return desktopState;
   const code = new Map();
-  const storage = new Map();
+  const cowork = [];
   let visible = false;
-  for (const dataDir of desktopDataDirs()) {
-    if (!existsSync(dataDir)) continue;
+  const extra = (await configuredPlaces()).claudeDesktop;
+  // The usual folders are often not there, and that says nothing. A folder
+  // named outright, in the environment or in the config file, is expected to
+  // be there and to be the app's. When it is not (a drive that is away, a
+  // mistyped path) that is said like a folder that cannot be read: the
+  // sessions in it are missing, not deleted.
+  const named = new Set(namedDesktopDirs(process.env, { extra }));
+  for (const dataDir of desktopDataDirs(process.env, { extra })) {
+    if (named.has(dataDir)) {
+      const trouble = await namedFolderTrouble(dataDir);
+      if (trouble) {
+        noteUnreadableFolder(dataDir, trouble);
+        continue;
+      }
+    } else if (!existsSync(dataDir)) {
+      continue;
+    }
     visible = true;
     const problems = [];
-    for (const [transcriptId, record] of await readCodeRecords(dataDir, problems)) {
+    const records = await readCodeRecords(dataDir, problems);
+    for (const [transcriptId, record] of records) {
       const known = code.get(transcriptId);
       if (!known || (record.lastActivityAt || 0) >= (known.lastActivityAt || 0)) code.set(transcriptId, record);
     }
-    // On Windows the app has two places for its data and can move between
-    // them. A session kept in both is one session: the copy last active.
-    for (const found of await findCoworkSessions(dataDir, problems)) {
-      const key = path.basename(found.storageDir);
-      const known = storage.get(key);
-      if (!known || (found.record.lastActivityAt || 0) > (known.record.lastActivityAt || 0)) storage.set(key, found);
-    }
+    // Every storage folder of every data folder. The app has more than one
+    // place for its data and can move between them, so a transcript may be
+    // there twice; which copy stands for it is settled transcript by
+    // transcript, where the projects are put together.
+    const folders = await findCoworkSessions(dataDir, problems);
+    cowork.push(...folders);
     for (const problem of problems) noteUnreadableFolder(problem.path, problem.reason);
+    // Only sessions show that a named folder is the right one: a record of
+    // a Code tab session, or a transcript in a Cowork folder.
+    if (named.has(dataDir) && records.size === 0 && problems.length === 0) {
+      let some = false;
+      for (const folder of folders) {
+        if ((some = await holdsATranscript(folder.projectsDir))) break;
+      }
+      if (!some) noteUnreadableFolder(dataDir, 'no sessions of the Claude desktop app in it');
+    }
   }
   // `visible`: whether this run can see the app's data at all. One that
   // cannot has nothing to say about which sessions the app knows.
-  desktopState = { readAt: Date.now(), code, cowork: [...storage.values()], visible };
+  desktopState = { readAt: Date.now(), code, cowork, visible };
   return desktopState;
 }
 
@@ -449,14 +505,19 @@ async function claudeProjectsIn(projectsDir, desktop = null) {
     if (sessionFiles.length === 0) continue;
 
     let totalSize = 0;
+    const transcripts = new Map();
     for (const file of sessionFiles) {
       const s = await statNoting(path.join(projectDir, file));
-      if (s) totalSize += s.size;
+      if (!s) continue;
+      totalSize += s.size;
+      if (ofApp) transcripts.set(file, { size: s.size, modified: s.mtimeMs });
     }
 
     // A Cowork session works inside a sandbox, so the folder the person gave
-    // it says more than the path it ran in.
-    const decoded = desktop?.folders[0] || await resolveClaudeProjectPath(projectDir) || desktop?.cwd || entry;
+    // it says more than the path it ran in. One that was given no folder ran
+    // in a place of the app's own, which is nobody's project.
+    const given = desktop?.folders[0] || null;
+    const decoded = given || await resolveClaudeProjectPath(projectDir) || desktop?.cwd || entry;
 
     projects.push({
       encoded: entry,
@@ -465,7 +526,8 @@ async function claudeProjectsIn(projectsDir, desktop = null) {
       sessionCount: sessionFiles.length,
       totalSize,
       dir: projectDir,
-      desktop
+      desktop,
+      ...(ofApp ? { transcripts, ownPlace: given === null } : { names: sessionFiles })
     });
   }
   return projects;
@@ -473,16 +535,100 @@ async function claudeProjectsIn(projectsDir, desktop = null) {
 
 // Projects of the Claude Code CLI, then those inside the desktop app's
 // Cowork sessions, which keep their transcripts in folders of their own.
+// A record the app wrote for a session, as opposed to the empty one that
+// stands in for a storage folder that has none.
+const isAppRecord = record => Boolean(record) && (record.desktopId !== null || record.transcriptIds.length > 0);
+
+// Marks a session as filed where a record of the app says, not merely where
+// a copy of it ran. Kept out of what is reported.
+const markFiledByRecord = session => Object.defineProperty(session, 'filedByRecord', { value: true, enumerable: false });
+
+// A project whose transcripts all have a newer copy elsewhere is still
+// returned, since what its subagents left is there. What a project here
+// counts is its files; sessions are counted where they are listed.
 async function getClaudeProjects() {
   const projects = existsSync(PROJECTS_DIR) ? await claudeProjectsIn(PROJECTS_DIR) : [];
+  const ofApp = [];
+  // The same transcript can be kept in more than one of the app's data
+  // folders: the app moves its data between them and leaves copies behind,
+  // not always under the same folder name. One copy stands for the session,
+  // the one written last. A transcript kept in only one place is listed
+  // from there, whatever else its folder has a newer copy of.
+  const standsFor = new Map();
+  const leaveOut = (project, file) => {
+    project.copies ||= new Set();
+    project.copies.add(file);
+  };
+  // What the app knows about the session comes with it, and need not sit
+  // beside the newest copy. Of the records beside the folders that hold a
+  // copy, one speaks for the transcript: a record that lists it before one
+  // that does not, any record before a folder that has none, and of two
+  // alike the one active last. `sole`: its folder held that one transcript.
+  const speaksFor = (record, id, sole) => ({ record, sole, weight: record.transcriptIds.includes(id) ? 2 : isAppRecord(record) ? 1 : 0 });
+  const louder = (one, other) => (!other || one.weight > other.weight ||
+    (one.weight === other.weight && (one.record.lastActivityAt || 0) > (other.record.lastActivityAt || 0)) ? one : other);
   for (const cowork of (await desktopSessions()).cowork) {
     const inside = await claudeProjectsIn(cowork.projectsDir, cowork.record);
     // A record that does not say which transcript is its own can only speak
     // for a storage folder that holds a single one.
-    const transcripts = inside.reduce((sum, project) => sum + project.sessionCount, 0);
-    for (const project of inside) project.desktopSole = transcripts === 1;
-    projects.push(...inside);
+    const count = inside.reduce((sum, project) => sum + project.sessionCount, 0);
+    for (const project of inside) {
+      project.desktopSole = count === 1;
+      for (const [file, written] of project.transcripts) {
+        const known = standsFor.get(file);
+        const said = louder(speaksFor(cowork.record, file.slice(0, -'.jsonl'.length), count === 1), known?.said || null);
+        const newer = !known || written.modified > known.written.modified ||
+          (written.modified === known.written.modified && written.size > known.written.size);
+        if (!newer) {
+          leaveOut(project, file);
+          known.said = said;
+          continue;
+        }
+        if (known) leaveOut(known.project, file);
+        standsFor.set(file, { project, written, said });
+      }
+    }
+    ofApp.push(...inside);
   }
+  // A transcript of the app can be under Claude Code's own directory as
+  // well: the app runs Claude Code with that directory set to the session's
+  // storage, so this tool, run from inside a Cowork session, finds the
+  // session's transcripts in both places. It is one session. The app's copy
+  // stands for it unless the other was written later, and either way it
+  // keeps what the app knows about it.
+  if (standsFor.size > 0) {
+    for (const project of projects) {
+      for (const file of project.names) {
+        const kept = standsFor.get(file);
+        if (!kept) continue;
+        const written = await statNoting(path.join(project.dir, file));
+        if (!written) continue;
+        if (written.mtimeMs > kept.written.modified ||
+          (written.mtimeMs === kept.written.modified && written.size > kept.written.size)) {
+          leaveOut(kept.project, file);
+          standsFor.set(file, { project, written: { size: written.size, modified: written.mtimeMs }, said: kept.said });
+        } else {
+          leaveOut(project, file);
+        }
+      }
+    }
+  }
+  // Where the record that speaks for a transcript is not the one beside the
+  // copy that stands for it, it is handed over with the transcript. A record
+  // that lists the transcript names it. One that does not still says which
+  // session it belongs to (its tab, its folder, whether it is archived) and
+  // names it only under the rule for a folder's own record: when it lists
+  // no transcript and its folder held a single one.
+  // A copy outside the app's folders is given even the stand-in of a folder
+  // that has no record: it says nothing of where the session is filed, and
+  // it does say that the transcript is a Cowork session's.
+  for (const [file, kept] of standsFor) {
+    const { record, weight, sole } = kept.said;
+    if (record === kept.project.desktop || (weight === 0 && kept.project.desktop)) continue;
+    kept.project.recordOf ||= new Map();
+    kept.project.recordOf.set(file, { record, names: weight === 2 || (weight === 1 && record.transcriptIds.length === 0 && sole) });
+  }
+  projects.push(...ofApp);
   return projects.sort((a, b) => a.path.localeCompare(b.path));
 }
 
@@ -601,18 +747,42 @@ async function getClaudeSubagentFiles(projectDir, project) {
   return found;
 }
 
-async function getClaudeSessionFiles(projectFilter = null, { subagents = false } = {}) {
+async function getClaudeSessionFiles(projectFilter = null, { subagents = false, names = true } = {}) {
   const projects = await getClaudeProjects();
   const codeRecords = (await desktopSessions()).code;
-  const sessions = [];
   const agents = new Map();
 
+  const wanted = projectFilter ? projectFilter.toLowerCase() : null;
+  const filedUnder = (project, filedAs) => wanted === null ||
+    filedAs.toLowerCase().includes(wanted) || project.encoded.toLowerCase().includes(wanted);
+  // What a subagent left is filed with the session it worked for, which can
+  // be listed from another folder than the one the subagent's transcript is
+  // in. So with a filter, sessions and subagents are sorted out at the end.
+  const found = [];
+  const elsewhereFiled = new Map();
+  // A resumed session can carry a copy of a subagent's transcript; the newer
+  // copy stands for the agent.
+  const collectAgents = async project => {
+    for (const agent of await getClaudeSubagentFiles(project.dir, project)) {
+      const existing = agents.get(agent.sessionId);
+      if (!existing || agent.modifiedAt > existing.modifiedAt) agents.set(agent.sessionId, agent);
+    }
+  };
+
   for (const project of projects) {
-    if (projectFilter) {
-      const pf = projectFilter.toLowerCase();
-      const matchesDecoded = project.path.toLowerCase().includes(pf);
-      const matchesEncoded = project.encoded.toLowerCase().includes(pf);
-      if (!matchesDecoded && !matchesEncoded) continue;
+    // A folder that cannot hold anything filed elsewhere is skipped early.
+    // Its sessions are still known as the ones subagents found in another
+    // folder may have worked for, so those are filed with them and not with
+    // the folder they were found in.
+    if (!filedUnder(project, project.path) && !project.recordOf && !project.copies) {
+      if (subagents) {
+        const filing = { project: project.path, projectEncoded: project.encoded, noProject: project.ownPlace === true, filedByRecord: isAppRecord(project.desktop) };
+        for (const file of project.names || project.transcripts.keys()) elsewhereFiled.set(file.slice(0, -'.jsonl'.length), filing);
+        // What a subagent left can sit here although the session it worked
+        // for is now listed from another folder, under another project.
+        await collectAgents(project);
+      }
+      continue;
     }
 
     const projectDir = project.dir;
@@ -620,16 +790,27 @@ async function getClaudeSessionFiles(projectFilter = null, { subagents = false }
     const sessionFiles = files.filter(f => f.endsWith('.jsonl'));
 
     for (const file of sessionFiles) {
+      // Another of the app's data folders holds a newer copy of this one.
+      if (project.copies?.has(file)) continue;
       const sessionId = file.replace('.jsonl', '');
       const filePath = path.join(projectDir, file);
       const stat = await statNoting(filePath);
       if (!stat) continue;
 
+      // The app's record of the session this copy stands for, when it sits
+      // beside another copy of the transcript than this one. It says which
+      // folder the session was given; when it was given none, the session
+      // is filed where it ran, whatever the folder this copy is in was given.
+      const elsewhere = project.recordOf?.get(file) || null;
+      const filedAs = !elsewhere
+        ? project.path
+        : elsewhere.record.folders[0] ||
+          (project.ownPlace === false ? await resolveClaudeProjectPath(projectDir) || elsewhere.record.cwd || project.encoded : project.path);
       const session = {
         sessionId,
         shortId: makeShortId('claude', sessionId),
         source: 'claude',
-        project: project.path,
+        project: filedAs,
         projectEncoded: project.encoded,
         filePath,
         size: stat.size,
@@ -637,37 +818,51 @@ async function getClaudeSessionFiles(projectFilter = null, { subagents = false }
       };
       // A session of the desktop app carries what the app knows about it:
       // which tab it belongs to and whether it is archived.
-      const desktop = project.desktop || codeRecords.get(sessionId);
+      const desktop = elsewhere?.record || project.desktop || codeRecords.get(sessionId);
       if (desktop) {
         session.app = 'desktop';
         session.desktopKind = desktop.kind;
         if (desktop.archived) session.archived = true;
       }
+      if (elsewhere ? !elsewhere.record.folders[0] : project.ownPlace) session.noProject = true;
+      if (isAppRecord(elsewhere ? elsewhere.record : project.desktop)) markFiledByRecord(session);
       // Its name is the one the app shows. A Cowork record names only the
-      // session's own transcript, not every transcript in its storage folder.
-      // Failing that, the name Claude Code holds for the session.
-      const own = !project.desktop
-        ? desktop
-        : desktop.transcriptId ? (desktop.transcriptId === sessionId ? desktop : null) : (project.desktopSole ? desktop : null);
-      const name = own?.title || await claudeSessionName(filePath, stat.size);
+      // session's own transcripts, not every transcript in its storage
+      // folder. Failing that, the name Claude Code holds for the session.
+      const own = elsewhere
+        ? (elsewhere.names ? elsewhere.record : null)
+        : !project.desktop
+          ? desktop
+          : desktop.transcriptIds.length > 0 ? (desktop.transcriptIds.includes(sessionId) ? desktop : null) : (project.desktopSole ? desktop : null);
+      // (Counting sessions does not take their names, which cost a read each.)
+      const name = own?.title || (names ? await claudeSessionName(filePath, stat.size) : null);
       if (name) {
         session.title = name;
         session.named = true;
       }
-      sessions.push(session);
+      found.push({ session, project });
     }
 
-    if (subagents) {
-      // A resumed session can carry a copy of a subagent's transcript; the
-      // newer copy stands for the agent.
-      for (const agent of await getClaudeSubagentFiles(projectDir, project)) {
-        const existing = agents.get(agent.sessionId);
-        if (!existing || agent.modifiedAt > existing.modifiedAt) agents.set(agent.sessionId, agent);
-      }
-    }
+    if (subagents) await collectAgents(project);
   }
 
-  return [...sessions, ...agents.values()].sort((a, b) => b.modifiedAt - a.modifiedAt);
+  // What a subagent did, it did where the session it worked for is filed,
+  // wherever its own transcript was found.
+  const parents = new Map(found.map(({ session }) => [session.sessionId, session]));
+  for (const agent of agents.values()) {
+    const parent = parents.get(agent.parentSessionId) || elsewhereFiled.get(agent.parentSessionId);
+    if (!parent) continue;
+    agent.project = parent.project;
+    agent.projectEncoded = parent.projectEncoded;
+    if (parent.noProject) agent.noProject = true;
+    else delete agent.noProject;
+    if (parent.filedByRecord) markFiledByRecord(agent);
+  }
+
+  const sessions = found.filter(({ session, project }) => filedUnder(project, session.project)).map(({ session }) => session);
+  const kept = [...agents.values()].filter(agent => wanted === null ||
+    agent.project.toLowerCase().includes(wanted) || (agent.projectEncoded || '').toLowerCase().includes(wanted));
+  return [...sessions, ...kept].sort((a, b) => b.modifiedAt - a.modifiedAt);
 }
 
 async function findJsonlFiles(rootDir) {
@@ -1051,14 +1246,21 @@ async function getSessionFiles(projectFilter = null, source = 'all', { subagents
     include('codex') ? getCodexSessionFiles(projectFilter) : [],
     include('kimi') ? getKimiSessionFiles(projectFilter) : []
   ]);
-  return groups.flat().sort((a, b) => b.modifiedAt - a.modifiedAt);
+  const sessions = groups.flat().sort((a, b) => b.modifiedAt - a.modifiedAt);
+  // A folder an app made for one conversation is nobody's project, whatever
+  // agent ran in it. (A Cowork session given no folder is marked where it
+  // is found, from the app's record of it.)
+  for (const session of sessions) {
+    if (isConversationFolder(session.project)) session.noProject = true;
+  }
+  return sessions;
 }
 
-function aggregateSessionsByProject(sessions, source) {
+function aggregateSessionsByProject(sessions, source, encodedOf = session => session.project) {
   const byProject = new Map();
   for (const session of sessions) {
     const current = byProject.get(session.project) || {
-      encoded: session.project,
+      encoded: encodedOf(session),
       path: session.project,
       source,
       sessionCount: 0,
@@ -1074,32 +1276,19 @@ function aggregateSessionsByProject(sessions, source) {
 async function getAllProjects(source = 'all') {
   const selected = parseSource(source);
   const include = (name) => selected === 'all' || selected === name;
-  const claudeProjects = include('claude') ? await getClaudeProjects() : [];
+  // Claude's projects are counted from its sessions, like the others', so a
+  // project here is what "list" files a session under: several Cowork
+  // sessions that worked in one folder are one project, a transcript the
+  // app keeps twice is counted once, and it is counted under the folder its
+  // session was given. The oldest session's folder name stands for the
+  // project. What discovery needs to find its way around stays out of what
+  // is reported.
+  const claudeSessions = include('claude') ? (await getClaudeSessionFiles(null, { names: false })).reverse() : [];
   const codexSessions = include('codex') ? await getCodexSessionFiles() : [];
   const kimiSessions = include('kimi') ? await getKimiSessionFiles() : [];
 
-  // Several Cowork sessions can have worked in one folder, and each keeps
-  // its transcripts apart: they count as one project. What discovery needs
-  // to find its way around (dir, desktop) stays out of what is reported.
-  const claudeByPath = new Map();
-  for (const project of claudeProjects) {
-    const known = claudeByPath.get(project.path);
-    if (known) {
-      known.sessionCount += project.sessionCount;
-      known.totalSize += project.totalSize;
-    } else {
-      claudeByPath.set(project.path, {
-        encoded: project.encoded,
-        path: project.path,
-        source: project.source,
-        sessionCount: project.sessionCount,
-        totalSize: project.totalSize
-      });
-    }
-  }
-
   const combined = [
-    ...claudeByPath.values(),
+    ...aggregateSessionsByProject(claudeSessions, 'claude', session => session.projectEncoded),
     ...aggregateSessionsByProject(codexSessions, 'codex'),
     ...aggregateSessionsByProject(kimiSessions, 'kimi')
   ];
@@ -2087,7 +2276,7 @@ async function searchLocal(query, opts) {
 // the outcome says why. Only labels have no file-scan equivalent.
 async function runSearch(query, opts) {
   const config = await loadConfig({ overrides: { backend: opts.local ? 'local' : undefined } });
-  if (config.warning) console.error(c.yellow(config.warning));
+  sayOnce(config.warning);
   const es = config.elasticsearch;
   const backend = config.search.backend;
   const wantsLabels = Boolean(opts.label?.length);
@@ -2261,7 +2450,7 @@ async function runSync(opts) {
   const config = await loadConfig({
     overrides: { url: opts.esUrl, index: opts.index, keep: opts.keep, allowRemote: opts.allowRemote }
   });
-  if (config.warning) console.error(c.yellow(config.warning));
+  sayOnce(config.warning);
   const es = config.elasticsearch;
 
   if (!isValidIndexName(es.index)) {
@@ -2310,6 +2499,12 @@ async function runSync(opts) {
     if (opts.prune && unreadableFolders.size > 0) {
       failWith(`Not pruning: ${plural(unreadableFolders.size, 'folder')} could not be read (${[...unreadableFolders.keys()].map(tildePath).join(', ')}), ` +
         'so sessions in them would look deleted. Run again without --prune, or once they can be read.');
+    }
+    // The config file names places to look in. While it cannot be used as
+    // written, the sessions in the places it meant are missing, not deleted.
+    if (opts.prune && placesInDoubt.length > 0) {
+      failWith(`Not pruning: the config file could not be used as written (${placesInDoubt[0]}), ` +
+        'so sessions in the folders it names would look deleted. Run again without --prune, or once the file is fixed.');
     }
     const since = sinceFromOptions(opts);
     let sessions = opts.project || opts.source !== 'all' ? await getSessionFiles(opts.project, opts.source, { subagents: true }) : everything;
@@ -2380,7 +2575,7 @@ async function runSync(opts) {
 // Connects to the configured index for the label commands, or exits.
 async function requireIndex() {
   const config = await loadConfig();
-  if (config.warning) console.error(c.yellow(config.warning));
+  sayOnce(config.warning);
   const es = config.elasticsearch;
   if (!es.url) {
     failWith('Labels are kept in the optional Elasticsearch index. Run "sessions sync" to set one up.');
