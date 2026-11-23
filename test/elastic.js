@@ -484,6 +484,49 @@ await test('environment URL wins over the config file', async () => {
   assert.equal(fromFlag.elasticsearch.url, 'http://127.0.0.1:3333');
 });
 
+await test('a host other than this machine is allowed by the flag, then the variable, then the file', async () => {
+  const yes = path.join(root, 'config-remote-yes.yaml');
+  const no = path.join(root, 'config-remote-no.yaml');
+  writeFileSync(yes, 'elasticsearch:\n  url: https://es.example.com\n  allow_remote: true\n');
+  writeFileSync(no, 'elasticsearch:\n  url: https://es.example.com\n');
+  const allowed = async (file, env = {}, overrides = {}) => (await loadConfig({ env: { SESSIONS_CONFIG: file, ...env }, overrides })).elasticsearch.allowRemote;
+  assert.equal(await allowed(no), false);
+  assert.equal(await allowed(yes), true);
+  assert.equal(await allowed(no, { SESSIONS_ES_ALLOW_REMOTE: 'true' }), true);
+  assert.equal(await allowed(no, { SESSIONS_ES_ALLOW_REMOTE: ' Yes ' }), true);
+  // A variable that says no overrides a file that says yes.
+  for (const value of ['false', '0', 'no', 'off', 'nope']) assert.equal(await allowed(yes, { SESSIONS_ES_ALLOW_REMOTE: value }), false, JSON.stringify(value));
+  // One that is set and empty says nothing, and the file is asked.
+  for (const value of ['', '  ']) assert.equal(await allowed(yes, { SESSIONS_ES_ALLOW_REMOTE: value }), true, JSON.stringify(value));
+  // The flag can only say yes.
+  assert.equal(await allowed(yes, { SESSIONS_ES_ALLOW_REMOTE: 'false' }, { allowRemote: true }), true);
+  assert.equal(await allowed(no, {}, { allowRemote: true }), true);
+  assert.equal(await allowed(no, {}, { allowRemote: false }), false);
+  assert.equal(await allowed(yes, {}, { allowRemote: false }), true);
+});
+
+await test('a refused host names what refused it', async () => {
+  const file = path.join(root, 'config-remote-refused.yaml');
+  writeFileSync(file, 'elasticsearch:\n  url: https://es.example.com\n  allow_remote: true\n');
+  // The file allows it and the variable says no: pointing at the file would not help.
+  const byVariable = await cli(['sync'], { ...baseEnv, SESSIONS_CONFIG: file, SESSIONS_ES_ALLOW_REMOTE: 'false' });
+  assert.equal(byVariable.status, 1);
+  assert.match(byVariable.stderr, /Refusing to touch https:\/\/es\.example\.com: it is not this machine/);
+  assert.match(byVariable.stderr, /SESSIONS_ES_ALLOW_REMOTE is set and says no, which overrides the config file\. Unset it or pass --allow-remote/);
+  // Nothing allows it: the usual advice.
+  writeFileSync(file, 'elasticsearch:\n  url: https://es.example.com\n');
+  const byDefault = await cli(['sync'], { ...baseEnv, SESSIONS_CONFIG: file });
+  assert.equal(byDefault.status, 1);
+  assert.match(byDefault.stderr, /Pass --allow-remote or set elasticsearch\.allow_remote: true/);
+  assert.doesNotMatch(byDefault.stderr, /SESSIONS_ES_ALLOW_REMOTE/);
+  // The variable says no and the file does not allow it either: taking the
+  // variable away would not be enough, and neither would the file.
+  const byBoth = await cli(['sync'], { ...baseEnv, SESSIONS_CONFIG: file, SESSIONS_ES_ALLOW_REMOTE: 'no' });
+  assert.equal(byBoth.status, 1);
+  assert.match(byBoth.stderr, /Pass --allow-remote to send them there anyway\. SESSIONS_ES_ALLOW_REMOTE is set and says no, so allowing the host in the config file would not be enough\./);
+  assert.doesNotMatch(byBoth.stderr, /Unset it/);
+});
+
 await test('generic ELASTICSEARCH_URL is never used', async () => {
   const config = await loadConfig({ env: { SESSIONS_CONFIG: path.join(root, 'absent.yaml'), ELASTICSEARCH_URL: 'https://shared.example.com' } });
   assert.equal(config.elasticsearch.url, null);

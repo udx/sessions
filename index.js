@@ -2275,10 +2275,14 @@ async function runSync(opts) {
     );
   }
   if (es.url && !opts.status && !opts.dryRun && !isLoopbackUrl(es.url) && !es.allowRemote) {
-    failWith(
-      `Refusing to touch ${displayUrl(es.url)}: it is not this machine, and transcripts can hold private material.\n` +
-      'Pass --allow-remote or set elasticsearch.allow_remote: true to send them there anyway.'
-    );
+    // A variable that says no overrides the file, so the advice depends on
+    // which of the two is in the way.
+    const advice = !es.remoteRefusedByVariable
+      ? 'Pass --allow-remote or set elasticsearch.allow_remote: true to send them there anyway.'
+      : es.remoteAllowedInFile
+        ? 'SESSIONS_ES_ALLOW_REMOTE is set and says no, which overrides the config file. Unset it or pass --allow-remote to send them there anyway.'
+        : 'Pass --allow-remote to send them there anyway. SESSIONS_ES_ALLOW_REMOTE is set and says no, so allowing the host in the config file would not be enough.';
+    failWith(`Refusing to touch ${displayUrl(es.url)}: it is not this machine, and transcripts can hold private material.\n${advice}`);
   }
 
   const elastic = await import('./lib/elastic.js');
