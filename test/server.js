@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import {
   appendFileSync,
@@ -16,6 +16,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { isConversationFolder } from '../lib/projects.js';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI = path.join(__dirname, '..', 'index.js');
 const root = mkdtempSync(path.join(os.tmpdir(), 'sessions-server-'));
@@ -26,6 +28,32 @@ const now = Date.now();
 const CLAUDE_ID = 'aaaaaaaa-1111-4222-8333-aaaaaaaaaaaa';
 const CODEX_ID = '019f0000-1111-7222-8333-abcdefabcdef';
 const KIMI_ID = 'dddddddd-1111-4222-8333-dddddddddddd';
+// A conversation Codex's desktop app started without a project: it ran in a
+// folder the app made for it.
+const LOOSE_ID = '019f0000-2222-7222-8333-abcdefabcdef';
+const LOOSE_DIR = '/Users/pat/Documents/Codex/2026-03-09/can-you';
+// Two Cowork sessions of the Claude desktop app: one given a folder to work
+// in, one given none, which the app runs in an empty system folder.
+const appDir = path.join(root, 'app-data');
+const COWORK_FOLDER_ID = '99999999-1111-4222-8333-aaaaaaaaaaaa';
+const COWORK_LOOSE_ID = '99999999-2222-4222-8333-bbbbbbbbbbbb';
+// And two that look alike by path: one given a folder that happens to sit
+// where the app's sandbox does, one left in the sandbox.
+const COWORK_ODD_FOLDER_ID = '99999999-3333-4222-8333-cccccccccccc';
+const COWORK_SANDBOX_ID = '99999999-4444-4222-8333-dddddddddddd';
+// Codex's conversation folders are under the person's Documents, so the
+// server is given the home directory the fixtures speak of.
+const serverEnv = {
+  ...process.env,
+  NO_COLOR: '1',
+  HOME: '/Users/pat',
+  USERPROFILE: '/Users/pat',
+  SESSIONS_CLAUDE_DIR: claudeDir,
+  SESSIONS_CLAUDE_DESKTOP_DIR: appDir,
+  SESSIONS_CODEX_DIR: codexDir,
+  SESSIONS_KIMI_DIR: kimiDir,
+  SESSIONS_CONFIG: path.join(root, 'absent.yaml')
+};
 let serverProcess;
 
 function writeJsonl(filePath, records) {
@@ -49,13 +77,7 @@ function message(type, text, model) {
 
 function startServer() {
   serverProcess = spawn(process.execPath, [CLI, '--serve', '--port', '0', '--active-minutes', '15'], {
-    env: {
-      ...process.env,
-      NO_COLOR: '1',
-      SESSIONS_CLAUDE_DIR: claudeDir,
-      SESSIONS_CODEX_DIR: codexDir,
-      SESSIONS_KIMI_DIR: kimiDir
-    },
+    env: serverEnv,
     stdio: ['ignore', 'pipe', 'pipe']
   });
   serverProcess.stdout.setEncoding('utf8');
@@ -111,6 +133,30 @@ try {
       { type: 'event_msg', timestamp: new Date(now - 7_000_000).toISOString(), payload: { type: 'agent_message', message: 'Codex response' } }
     ]
   );
+  const looseFile = writeJsonl(
+    path.join(codexDir, 'sessions', '2026', '11', '06', `rollout-2026-11-06T00-00-00-test-${LOOSE_ID}.jsonl`),
+    [
+      { type: 'session_meta', timestamp: new Date(now - 9_200_000).toISOString(), payload: { id: LOOSE_ID, cwd: LOOSE_DIR, originator: 'Codex Desktop' } },
+      { type: 'turn_context', payload: { cwd: LOOSE_DIR, model: 'gpt-test' } },
+      { type: 'event_msg', timestamp: new Date(now - 9_100_000).toISOString(), payload: { type: 'user_message', message: 'Can you compare two phone plans' } },
+      { type: 'event_msg', timestamp: new Date(now - 9_000_000).toISOString(), payload: { type: 'agent_message', message: 'The second plan is cheaper.' } }
+    ]
+  );
+  const coworkDir = path.join(appDir, 'local-agent-mode-sessions', 'acct', 'org');
+  const coworkFiles = [];
+  for (const [name, id, cwd, fields] of [
+    ['local_given', COWORK_FOLDER_ID, '/private/var/empty', { title: 'Quarterly report draft', userSelectedFolders: ['/Users/pat/Reports'] }],
+    ['local_loose', COWORK_LOOSE_ID, '/private/var/empty', { title: 'Naming ideas' }],
+    ['local_odd', COWORK_ODD_FOLDER_ID, '/sessions/calm-ibis', { title: 'Billing cleanup', userSelectedFolders: ['/sessions/billing-api'] }],
+    ['local_sandbox', COWORK_SANDBOX_ID, '/sessions/brave-otter', { title: 'Trip ideas' }]
+  ]) {
+    mkdirSync(coworkDir, { recursive: true });
+    writeFileSync(path.join(coworkDir, `${name}.json`), JSON.stringify({ sessionId: name, cliSessionId: id, sessionType: 'agent', ...fields }));
+    coworkFiles.push(writeJsonl(path.join(coworkDir, name, '.claude', 'projects', cwd.replace(/\//g, '-'), `${id}.jsonl`), [
+      { ...message('user', 'A Cowork prompt'), cwd },
+      { ...message('assistant', 'A Cowork answer', 'claude-test'), cwd }
+    ]));
+  }
   const kimiSessionDir = path.join(kimiDir, 'sessions', 'wd_kimi_aabbccddeeff', `session_${KIMI_ID}`);
   mkdirSync(kimiSessionDir, { recursive: true });
   writeFileSync(path.join(kimiSessionDir, 'state.json'), JSON.stringify({
@@ -129,20 +175,23 @@ try {
   const old = new Date(now - 7_200_000);
   utimesSync(codexFile, old, old);
   utimesSync(kimiFile, old, old);
+  const older = new Date(now - 9_000_000);
+  utimesSync(looseFile, older, older);
+  for (const file of coworkFiles) utimesSync(file, older, older);
   const baseUrl = await startServer();
   const response = await fetch(`${baseUrl}/api/sessions`);
   assert.equal(response.status, 200);
   assert.match(response.headers.get('cache-control'), /no-store/);
   const data = await response.json();
   assert.equal(data.activeMinutes, 15);
-  assert.equal(data.sessions.length, 3);
+  assert.equal(data.sessions.length, 8);
   assert.equal(data.sessions.filter(session => session.active).length, 1);
-  assert.equal(data.sessions.filter(session => !session.active).length, 2);
+  assert.equal(data.sessions.filter(session => !session.active).length, 7);
   assert.equal('insights' in data, false);
   console.log('  ✓ --serve returns active and past sessions');
 
-  const claude = data.sessions.find(session => session.source === 'claude');
-  const codex = data.sessions.find(session => session.source === 'codex');
+  const claude = data.sessions.find(session => session.sessionId === CLAUDE_ID);
+  const codex = data.sessions.find(session => session.sessionId === CODEX_ID);
   const kimi = data.sessions.find(session => session.source === 'kimi');
   assert.equal(claude.active, true);
   assert.equal(claude.project, '/workspace/claude');
@@ -162,13 +211,71 @@ try {
   assert.equal('filePath' in kimi, false);
   for (const session of data.sessions) {
     assert.equal(session.activity.length, 7);
-    assert.equal(session.activity.reduce((sum, day) => sum + day.count, 0), session.source === 'claude' ? 3 : 2);
+    assert.equal(session.activity.reduce((sum, day) => sum + day.count, 0), session.sessionId === CLAUDE_ID ? 3 : 2);
   }
   console.log('  ✓ session metadata, seven-day activity, and resume commands are correct');
 
+  // A session that ran in a folder made for the one conversation is marked,
+  // so the page can file those together. Where it ran is still reported, and
+  // the command to resume it still goes there.
+  const loose = data.sessions.find(session => session.sessionId === LOOSE_ID);
+  assert.deepEqual([loose.noProject, loose.project], [true, LOOSE_DIR]);
+  assert.equal(loose.resumeCommand, `cd '${LOOSE_DIR}' && codex resume '${LOOSE_ID}'`);
+  for (const session of [claude, codex, kimi]) assert.equal(session.noProject, false, session.source);
+  // A Cowork session is filed under the folder it was given. One that was
+  // given none ran in the app's own place, which is nobody's project.
+  const given = data.sessions.find(session => session.sessionId === COWORK_FOLDER_ID);
+  const ungiven = data.sessions.find(session => session.sessionId === COWORK_LOOSE_ID);
+  assert.deepEqual([given.noProject, given.project, given.title], [false, '/Users/pat/Reports', 'Quarterly report draft']);
+  assert.deepEqual([ungiven.noProject, ungiven.project, ungiven.title], [true, '/private/var/empty', 'Naming ideas']);
+  // What tells them apart is the app's record, not the look of the path: a
+  // folder the session was given is a project wherever it is, and the
+  // sandbox is none.
+  const oddFolder = data.sessions.find(session => session.sessionId === COWORK_ODD_FOLDER_ID);
+  const sandboxed = data.sessions.find(session => session.sessionId === COWORK_SANDBOX_ID);
+  assert.deepEqual([oddFolder.noProject, oddFolder.project], [false, '/sessions/billing-api']);
+  assert.deepEqual([sandboxed.noProject, sandboxed.project], [true, '/sessions/brave-otter']);
+  // A folder Codex's desktop app made for one conversation is that, whatever
+  // agent is run in it later. Only under the app's own root: a project that
+  // merely has a dated folder named Codex above it is a project.
+  const home = '/Users/pat';
+  for (const project of [
+    '/Users/pat/Documents/Codex/2026-03-09/can-you',
+    '/Users/pat/Documents/Codex/2026-03-09/can-you/work'
+  ]) assert.equal(isConversationFolder(project, home), true, project);
+  assert.equal(isConversationFolder('C:\\Users\\pat\\Documents\\Codex\\2026-03-09\\can-you', 'C:\\Users\\pat'), true);
+  assert.equal(isConversationFolder('c:\\users\\pat\\OneDrive - Work\\Documents\\Codex\\2026-03-09\\can-you', 'C:\\Users\\pat'), true);
+  // Windows does not tell folders apart by letter case; elsewhere it counts.
+  assert.equal(isConversationFolder('C:\\Users\\pat\\documents\\codex\\2026-03-09\\can-you', 'C:\\Users\\pat'), true);
+  assert.equal(isConversationFolder('C:\\Users\\pat\\onedrive\\documents\\codex\\2026-03-09\\can-you', 'C:\\Users\\pat'), true);
+  assert.equal(isConversationFolder('/Users/pat/documents/codex/2026-03-09/can-you', home), false);
+  for (const project of [
+    '/workspace/codex',
+    '/Users/pat/Documents/Codex',
+    '/Users/pat/Documents/Codex/2026-03-09',
+    '/Users/pat/Documents/Codex/notes/can-you',
+    '/Users/pat/work/2026-03-09/can-you',
+    '/work/Codex/2026-03-09/api',
+    // The same names inside a repository, or under someone else's home.
+    '/work/repo/Documents/Codex/2026-03-09/api',
+    '/Users/pat/work/repo/Documents/Codex/2026-03-09/api',
+    '/Users/sam/Documents/Codex/2026-03-09/can-you',
+    '/sessions/brave-otter',
+    '/private/var/empty',
+    '',
+    null,
+    undefined
+  ]) assert.equal(isConversationFolder(project, home), false, String(project));
+  assert.equal(isConversationFolder('/Users/pat/Documents/Codex/2026-03-09/can-you', ''), false);
+  // The same mark in what the command line reports.
+  const listed = JSON.parse(spawnSync(process.execPath, [CLI, 'list', '--json', '-n', '50'], { encoding: 'utf8', env: serverEnv }).stdout);
+  assert.deepEqual(listed.filter(session => session.noProject).map(session => session.sessionId).sort(), [LOOSE_ID, COWORK_LOOSE_ID, COWORK_SANDBOX_ID].sort());
+  assert.equal(listed.filter(session => 'noProject' in session && session.noProject !== true).length, 0);
+  console.log('  ✓ sessions that ran in no project are told apart from those that did');
+
   appendFileSync(claudeFile, JSON.stringify(message('user', 'New live prompt')) + '\n');
   const refreshed = await (await fetch(`${baseUrl}/api/sessions`)).json();
-  const refreshedClaude = refreshed.sessions.find(session => session.source === 'claude');
+  const refreshedClaude = refreshed.sessions.find(session => session.sessionId === CLAUDE_ID);
   assert.equal(refreshedClaude.messageCount, 4);
   assert.equal(refreshedClaude.userCount, 3);
   assert.equal(refreshedClaude.activity.reduce((sum, day) => sum + day.count, 0), 4);
@@ -210,6 +317,7 @@ try {
   assert(!/https?:\/\//.test(styles), 'the stylesheet loads nothing from outside this machine');
   const script = await (await fetch(`${baseUrl}/dashboard.js`)).text();
   assert(script.includes('Copy command'));
+  assert(script.includes('No project'));
   assert(script.includes('createActivityChart'));
   assert(script.includes('Recent conversation'));
   assert(!script.includes('/api/insights'));
@@ -218,13 +326,13 @@ try {
   console.log('  ✓ dashboard assets and refresh behavior are served');
 
   assert.equal((await fetch(`${baseUrl}/api/insights`)).status, 404);
-  const packedFiles = ['dashboard/dashboard.html', 'dashboard/dashboard.css', 'dashboard/dashboard.js', 'dashboard/markdown.js', 'lib/server.js'];
+  const packedFiles = ['dashboard/dashboard.html', 'dashboard/dashboard.css', 'dashboard/dashboard.js', 'dashboard/markdown.js', 'lib/server.js', 'lib/projects.js'];
   for (const file of packedFiles) {
     assert(readFileSync(path.join(__dirname, '..', file), 'utf8').length > 0);
   }
   console.log('  ✓ local-only server exposes only the packaged dashboard assets');
 
-  console.log('\n6 passed, 0 failed\n');
+  console.log('\n7 passed, 0 failed\n');
 } finally {
   if (serverProcess && serverProcess.exitCode === null && serverProcess.signalCode === null) {
     const exited = once(serverProcess, 'exit');

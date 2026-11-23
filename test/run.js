@@ -22,6 +22,7 @@ const SUITES = {
   elastic: 'the Elasticsearch index, sync and search',
   agents: 'sessions init, sessions guide, and what they claim',
   server: 'the dashboard server',
+  dashboard: 'the dashboard page in a browser (skipped unless SESSIONS_TEST_CHROME names one)',
   markdown: 'how the dashboard renders text'
 };
 

@@ -529,6 +529,10 @@ input::placeholder {
   white-space: nowrap;
 }
 
+.cell-project.none {
+  color: var(--muted);
+}
+
 .cell-count {
   color: var(--secondary);
   font: 400 12px/16px var(--mono);

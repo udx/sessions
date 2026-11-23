@@ -24,6 +24,13 @@ const elements = {
   toast: document.querySelector('#toast')
 };
 
+// Sessions that ran in no project (a folder an app made for the one
+// conversation, or the app's own sandbox) are filed together, under one
+// entry at the end of the projects.
+const NO_PROJECT = ':none';
+const NO_PROJECT_LABEL = 'No project';
+const projectOf = session => (session.noProject ? NO_PROJECT : session.project);
+
 const numberFormat = new Intl.NumberFormat();
 const expandedSessions = new Set();
 const transcriptCache = new Map();
@@ -87,7 +94,7 @@ function sourceTag(source) {
 // the sessions that pass every filter but its own.
 function matches(session, query, { source = true, project = true } = {}) {
   if (source && state.source !== 'all' && session.source !== state.source) return false;
-  if (project && state.project !== 'all' && session.project !== state.project) return false;
+  if (project && state.project !== 'all' && projectOf(session) !== state.project) return false;
   if (state.status === 'active' && !session.active) return false;
   if (state.status === 'past' && session.active) return false;
   if (!query) return true;
@@ -113,7 +120,7 @@ function filteredSessions() {
 
 function updateStats() {
   const active = state.sessions.filter(session => session.active).length;
-  const projects = new Set(state.sessions.map(session => session.project));
+  const projects = new Set(state.sessions.filter(session => !session.noProject).map(session => session.project));
   document.querySelector('#total-stat').textContent = numberFormat.format(state.sessions.length);
   document.querySelector('#active-stat').textContent = numberFormat.format(active);
   document.querySelector('#projects-stat').textContent = numberFormat.format(projects.size);
@@ -140,11 +147,13 @@ function indexSessions() {
   const latest = new Map();
   for (const session of state.sessions) {
     const at = Date.parse(session.lastActiveAt) || 0;
-    if (!latest.has(session.project) || at > latest.get(session.project)) latest.set(session.project, at);
+    const project = projectOf(session);
+    if (!latest.has(project) || at > latest.get(project)) latest.set(project, at);
   }
+  if (state.project !== 'all' && !latest.has(state.project)) state.project = 'all';
+  latest.delete(NO_PROJECT);
   state.projectOrder = [...latest.keys()].sort((a, b) => latest.get(b) - latest.get(a) || a.localeCompare(b));
   state.projectLabels = projectLabels(state.projectOrder);
-  if (state.project !== 'all' && !latest.has(state.project)) state.project = 'all';
 
   const known = ['claude', 'codex', 'kimi'];
   const present = new Set(state.sessions.map(session => session.source));
@@ -181,7 +190,7 @@ function renderRail() {
     }
     if (matches(session, query, { project: false })) {
       projectTotal++;
-      byProject.set(session.project, (byProject.get(session.project) || 0) + 1);
+      byProject.set(projectOf(session), (byProject.get(projectOf(session)) || 0) + 1);
     }
   }
 
@@ -196,6 +205,10 @@ function renderRail() {
     const count = byProject.get(project) || 0;
     if (count === 0 && state.project !== project) continue;
     projects.push(railItem(state.projectLabels.get(project), count, state.project === project, 'project', project, project));
+  }
+  const unfiled = byProject.get(NO_PROJECT) || 0;
+  if (unfiled > 0 || state.project === NO_PROJECT) {
+    projects.push(railItem(NO_PROJECT_LABEL, unfiled, state.project === NO_PROJECT, 'project', NO_PROJECT, 'Sessions that did not run in a project folder'));
   }
   elements.projects.replaceChildren(...projects);
 
@@ -381,7 +394,9 @@ function createSessionCard(session) {
   if (session.archived) sub.append(element('span', '', 'Archived'));
   cell.append(status, sourceTag(session.source), title, sub);
 
-  const project = element('div', 'cell-project', state.projectLabels.get(session.project) || session.project);
+  const project = session.noProject
+    ? element('div', 'cell-project none', NO_PROJECT_LABEL)
+    : element('div', 'cell-project', state.projectLabels.get(session.project) || session.project);
   project.title = session.project;
 
   const count = element('div', 'cell-count', numberFormat.format(session.messageCount));

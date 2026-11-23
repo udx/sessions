@@ -56,7 +56,7 @@ sessions serve --port 4220 --open
 sessions serve --active-minutes 30
 ```
 
-Open `http://127.0.0.1:4220` to browse all active and past sessions, in a dark or light interface that follows your system. A rail on the left filters by agent and by project, each with a count; the list shows each session's agent, prompt or title, short ID, model, project folder, message count, seven-day activity and last activity. Filter by status, agent, project, or search text. Select a title to reveal its full first prompt, additional details, and recent conversation with formatted Markdown links, lists, code, and tables; load earlier messages inline without leaving the list. Raw HTML remains escaped text and unsafe links are blocked. Expanded rows stay open during refreshes. **Copy command** copies the native CLI command (`claude --resume`, `codex resume`, or `kimi --session`) with the correct project directory.
+Open `http://127.0.0.1:4220` to browse all active and past sessions, in a dark or light interface that follows your system. A rail on the left filters by agent and by project, each with a count. Sessions that ran in no project are filed together under **No project**, at the end: the conversations Codex's desktop app starts without a project, each in a folder it makes for that one conversation, and Cowork sessions that were given no folder. The list shows each session's agent, prompt or title, short ID, model, project folder, message count, seven-day activity and last activity. Filter by status, agent, project, or search text. Select a title to reveal its full first prompt, additional details, and recent conversation with formatted Markdown links, lists, code, and tables; load earlier messages inline without leaving the list. Raw HTML remains escaped text and unsafe links are blocked. Expanded rows stay open during refreshes. **Copy command** copies the native CLI command (`claude --resume`, `codex resume`, or `kimi --session`) with the correct project directory.
 
 The page refreshes every 60 seconds and on demand. Sessions modified within the last 15 minutes count as active; archived sessions always count as past. Metadata is cached by transcript modification time and size, so refreshes only reread changed sessions. The server binds to localhost by default because session metadata is private. Use `--host` only if you understand the exposure, `--port 0` to choose a free port, and `--open` to launch a browser. Press Ctrl+C to stop the server.
 
@@ -394,6 +394,14 @@ Kimi Code sessions come in two on-disk generations, and both are read. Modern se
 
 ## Changelog
 
+### 1.12.1
+- The Claude desktop app's sessions are found in every folder the app keeps its data in. It has more than one (`Claude`, `Claude-3p`, and more on Windows), and 1.12.0 did not look in all of them, so on a setup that uses another one no desktop session was found. Every one that exists is read now, with nothing to set up, and a transcript the app keeps in two of them, or that is also under Claude Code's own directory, is listed once
+- A Cowork session keeps its title and its folder when the app names the session's storage folder differently from its record, as newer versions of the app do. The two are paired by name or, failing that, by the transcripts the record lists. In 1.12.0 such a session was listed without a title, under the path it ran in. With an index, the next sync reads such a session again, so a search by project finds it under its folder
+- `paths.claude_desktop` in `~/.sessions/config.yaml` names more data folders of the desktop app to read, for a machine that keeps them somewhere else. Every command that looks for sessions reads the file now, and says so when it cannot use it
+- A data folder that is named outright, there or in `SESSIONS_CLAUDE_DESKTOP_DIR`, and is missing or holds no sessions of the app is named on stderr, and `sync --prune` is refused while it is, since the sessions that should be in it would look deleted. It is refused likewise while the config file cannot be used as written. A missing folder named in the variable used to be passed over in silence
+- The dashboard files sessions that ran in no project under one **No project** entry. Codex's desktop app gives a conversation started without a project a folder of its own, and each of those was listed as a project, burying the real ones. Cowork sessions that were given no folder are filed there too, and `list --json` marks both with `noProject: true`
+- `SESSIONS_ES_ALLOW_REMOTE` set to a value that means no now overrides `elasticsearch.allow_remote: true` in the config file, the way a variable overrides the file for every other setting
+
 ### 1.12.0
 - Sessions of the Claude desktop app are read. Cowork sessions, which the app keeps in its own data folder, are listed, shown, searched and indexed with the rest. Code tab sessions were already read; they now carry the title the app shows and its archived state, and both kinds are marked `(desktop)`
 - A session is listed by its name when it has one, and a search finds it by that name, with a match of type `title`, when none of its messages match. Names come from the desktop app, from Kimi Code and from `/rename`; Claude Code's are read from the places its own session list reads them, so no listing has to read a whole transcript for one. Kimi titles were read before but never shown in `list`
@@ -514,9 +522,10 @@ test/         one script per area, and run.js to run them
 npm test                         # every suite
 node test/run.js search desktop  # only some
 SESSIONS_TEST_ES_URL=http://127.0.0.1:9220 node test/elastic.js   # also against a real Elasticsearch
+SESSIONS_TEST_CHROME="/path/to/chrome" node test/dashboard.js      # the dashboard page in a real browser
 ```
 
-The tests write their own transcripts to a temporary folder and never read yours. The last command creates and removes an index of its own, named `sessions-test-<pid>`.
+The tests write their own transcripts to a temporary folder and never read yours. The Elasticsearch command creates and removes an index of its own, named `sessions-test-<pid>`. The browser one needs Node 22 or newer and drives a headless Chrome with a profile of its own; without the variable that suite says it was skipped.
 
 ## License
 
